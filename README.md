@@ -50,10 +50,11 @@ buildall.cmd      # all backends (CUDA + Vulkan + CPU, runtime loading)
 ### Linux / macOS
 
 ```bash
-./buildcuda.sh    # NVIDIA GPU
-./buildvulkan.sh  # AMD/Intel GPU (Vulkan)
-./buildcpu.sh     # CPU only (with BLAS)
-./buildall.sh     # all backends (CUDA + Vulkan + CPU, runtime loading)
+./buildcuda.sh                   # NVIDIA GPU
+./buildvulkan.sh                 # AMD/Intel GPU (Vulkan)
+./buildcpu.sh                    # CPU only (with BLAS)
+./buildall.sh                    # all backends (CUDA + Vulkan + CPU, runtime loading)
+NVCC_CCBIN=g++-13 ./buildcuda.sh # rolling release distros (Arch w/ GCC 16, etc.)
 ```
 
 macOS auto-enables Metal and Accelerate BLAS with any of the above.
