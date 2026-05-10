@@ -122,30 +122,18 @@
 			const { requests, latents } = await jobResultUnderstand(jobId);
 			clearJob('lm');
 			if (song.id != null) {
-				const newLatents = latents ?? song.latents ?? undefined;
-				const newRequest =
-					requests.length > 0 && !song.request.caption ? requests[0] : { ...song.request };
-				const dirty = newLatents !== song.latents || newRequest !== song.request;
+				const useNewRequest = requests.length > 0 && !song.request.caption;
+				const newRequest = useNewRequest ? requests[0] : song.request;
+				const dirty = (latents && latents !== song.latents) || newRequest !== song.request;
 				if (dirty) {
-					// Rebuild a plain object: $props in Svelte 5 are Proxies and
-					// IndexedDB structuredClone refuses Proxies. Listing fields by
-					// hand also avoids cloning the audio Blob, which is large.
-					const enriched: Song = {
-						id: song.id,
-						name: song.name,
-						format: song.format,
-						created: song.created,
-						caption: newRequest.caption ?? song.caption,
-						seed: newRequest.seed ?? song.seed,
-						duration: newRequest.duration ?? song.duration,
-						request: newRequest,
-						audio: song.audio,
-						...(song.favorite ? { favorite: true } : {}),
-						...(newLatents ? { latents: newLatents } : {})
-					};
-					await putSong(enriched);
 					if (latents) song.latents = latents;
-					if (newRequest !== song.request) song.request = newRequest;
+					if (useNewRequest) {
+						song.request = newRequest;
+						song.caption = newRequest.caption ?? song.caption;
+						song.seed = newRequest.seed ?? song.seed;
+						song.duration = newRequest.duration ?? song.duration;
+					}
+					await putSong($state.snapshot(song));
 				}
 			}
 			app.name = song.name;
@@ -188,10 +176,9 @@
 	}
 
 	// VAE-only scan: POST /vae with the source audio (encode path), attach
-	// the fresh latents to the card non-destructively. Plain-object rebuild
-	// like scan() to dodge Svelte 5 Proxy + IndexedDB structuredClone, minus
-	// the LM roundtrip. Ideal for priming a cover/repaint target without
-	// paying the LM cost just to get the [VAE] badge lit.
+	// the fresh latents to the card non-destructively. Skips the LM
+	// roundtrip. Ideal for priming a cover/repaint target without paying
+	// the LM cost just to get the [VAE] badge lit.
 	async function encodeOnly() {
 		if (song.latents || song.id == null) return;
 		scanning = true;
@@ -201,21 +188,8 @@
 			await pollJob(jobId);
 			const latents = await jobResultLatents(jobId);
 			clearJob('lm');
-			const enriched: Song = {
-				id: song.id,
-				name: song.name,
-				format: song.format,
-				created: song.created,
-				caption: song.caption,
-				seed: song.seed,
-				duration: song.duration,
-				request: { ...song.request },
-				audio: song.audio,
-				...(song.favorite ? { favorite: true } : {}),
-				latents
-			};
-			await putSong(enriched);
 			song.latents = latents;
+			await putSong($state.snapshot(song));
 		} catch (e: unknown) {
 			toast(e instanceof Error ? e.message : String(e));
 		} finally {
@@ -231,20 +205,7 @@
 	async function toggleFavorite() {
 		if (song.id == null) return;
 		song.favorite = !song.favorite;
-		const enriched: Song = {
-			id: song.id,
-			name: song.name,
-			format: song.format,
-			created: song.created,
-			caption: song.caption,
-			seed: song.seed,
-			duration: song.duration,
-			request: { ...song.request },
-			audio: song.audio,
-			...(song.favorite ? { favorite: true } : {}),
-			...(song.latents ? { latents: song.latents } : {})
-		};
-		await putSong(enriched);
+		await putSong($state.snapshot(song));
 	}
 
 	function openRename() {
@@ -260,20 +221,7 @@
 		const v = renameValue.trim();
 		if (!v || v === song.name) return;
 		song.name = v;
-		const enriched: Song = {
-			id: song.id,
-			name: song.name,
-			format: song.format,
-			created: song.created,
-			caption: song.caption,
-			seed: song.seed,
-			duration: song.duration,
-			request: { ...song.request },
-			audio: song.audio,
-			...(song.favorite ? { favorite: true } : {}),
-			...(song.latents ? { latents: song.latents } : {})
-		};
-		await putSong(enriched);
+		await putSong($state.snapshot(song));
 	}
 
 	async function doRemove() {
