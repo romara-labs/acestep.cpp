@@ -127,7 +127,6 @@ struct SynthState {
     // noise + output
     std::vector<float> noise;
     std::vector<float> output;
-    std::vector<int>   per_S;
 
     // debug / timing
     DebugDumper dbg;

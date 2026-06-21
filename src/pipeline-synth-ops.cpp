@@ -817,13 +817,6 @@ void ops_init_noise(const AceSynth * ctx, const AceRequest * reqs, int batch_n, 
     // DiT Generate
     s.output.resize(batch_n * s.Oc * s.T);
 
-    // Per-batch sequence lengths for attention padding masks.
-    // Within a synth_batch_size group, all elements share the same s.T (same codes),
-    // so s.per_S[b] = s.S for all b. The s.per_enc_S[] array has real encoder lengths
-    // from per-batch text encoding above.
-    // These become meaningful when the server/CLI batches requests with different s.T.
-    s.per_S.assign(batch_n, s.S);
-
     // Debug dumps (sample 0)
     debug_dump_2d(&s.dbg, "noise", s.noise.data(), s.T, s.Oc);
     debug_dump_2d(&s.dbg, "context", s.context.data(), s.T, s.ctx_ch);
@@ -848,7 +841,7 @@ int ops_dit_generate(const AceSynth * ctx, int batch_n, SynthState & s, bool (*c
         dit, s.noise.data(), s.context.data(), s.enc_hidden.data(), s.enc_S, s.T, batch_n, s.num_steps,
         s.schedule.data(), s.output.data(), s.guidance_scale, &s.dbg,
         s.context_silence.empty() ? nullptr : s.context_silence.data(), s.cover_steps, cancel, cancel_data,
-        s.per_S.data(), s.per_enc_S.data(), s.enc_hidden_nc.empty() ? nullptr : s.enc_hidden_nc.data(),
+        s.per_enc_S.data(), s.enc_hidden_nc.empty() ? nullptr : s.enc_hidden_nc.data(),
         s.per_enc_S_nc_final.empty() ? nullptr : s.per_enc_S_nc_final.data(), s.seeds.data(), ctx->params.use_batch_cfg,
         s.rr.dcw_scaler, s.rr.dcw_high_scaler, s.rr.dcw_mode.c_str(), s.rr.solver.c_str(), s.rr.stork_substeps);
     if (dit_rc != 0) {

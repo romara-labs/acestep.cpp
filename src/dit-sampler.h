@@ -145,7 +145,6 @@ static int dit_ggml_generate(DiTGGML *           model,
                              int                 cover_steps    = -1,
                              bool (*cancel)(void *)             = nullptr,
                              void *          cancel_data        = nullptr,
-                             const int *     real_S             = nullptr,
                              const int *     real_enc_S         = nullptr,
                              const float *   enc_switch         = nullptr,
                              const int *     real_enc_S_switch  = nullptr,
@@ -209,8 +208,9 @@ static int dit_ggml_generate(DiTGGML *           model,
     // more aggressive aliasing, causing batch sample 1+ to produce noise.
     ggml_backend_sched_reset(model->sched);
     if (model->backend != model->cpu_backend) {
-        const char * input_names[] = { "enc_hidden", "input_latents", "t",           "t_r",
-                                       "positions",  "sa_mask_sw",    "sa_mask_pad", "ca_mask" };
+        const char * input_names[] = {
+            "enc_hidden", "input_latents", "t", "t_r", "positions", "sa_mask_sw", "ca_mask"
+        };
         for (const char * iname : input_names) {
             struct ggml_tensor * t = ggml_graph_get_tensor(gf, iname);
             if (t) {
@@ -241,45 +241,34 @@ static int dit_ggml_generate(DiTGGML *           model,
     }
     ggml_backend_tensor_set(t_pos, pos_data.data(), 0, S * N_graph * sizeof(int32_t));
 
-    // Self-attention masks: per-batch, combines sliding window and padding.
+    // Self-attention sliding window mask for layer_type=0.
     // GGML flash_attn_ext mask layout: [ne0=KV_len, ne1=Q_len, 1, N_graph]
     // Linear element offset: ki + qi*ne0 + b*ne0*ne1
-    //   sa_mask_sw  [S, S, 1, N_graph]: layer_type=0 (sliding window + padding)
-    //   sa_mask_pad [S, S, 1, N_graph]: layer_type=1 (full attention, padding only)
-    // When real_S is NULL, all positions are real (mask is all 0.0).
-    struct ggml_tensor * t_sa_mask_sw  = ggml_graph_get_tensor(gf, "sa_mask_sw");
-    struct ggml_tensor * t_sa_mask_pad = ggml_graph_get_tensor(gf, "sa_mask_pad");
+    //   sa_mask_sw  [S, S, 1, N_graph]: bidirectional window |qi - ki| <= win
+    // Full-attention layers (layer_type=1) run unmasked, no tensor needed.
+    struct ggml_tensor * t_sa_mask_sw = ggml_graph_get_tensor(gf, "sa_mask_sw");
 
     int                   win = c.sliding_window;
     std::vector<uint16_t> sa_sw_data(S * S * N_graph);
-    std::vector<uint16_t> sa_pad_data(S * S * N_graph);
 
-    // Fill masks for real samples, then duplicate for uncond slots
+    // Fill mask for real samples, then duplicate for uncond slots
     for (int b = 0; b < N; b++) {
-        int rs = real_S ? real_S[b] : S;  // real sequence length for this batch element
         for (int qi = 0; qi < S; qi++) {
             for (int ki = 0; ki < S; ki++) {
-                bool real_pos = (qi < rs) && (ki < rs);
-                int  dist     = (qi > ki) ? (qi - ki) : (ki - qi);
-                bool in_win   = (win <= 0) || (S <= win) || (dist <= win);
+                int  dist   = (qi > ki) ? (qi - ki) : (ki - qi);
+                bool in_win = (win <= 0) || (S <= win) || (dist <= win);
 
                 // offset = ki + qi*S + b*S*S  (ne0=S indexed by ki, ne1=S indexed by qi)
                 int off = b * S * S + qi * S + ki;
 
-                float sw_val    = (real_pos && in_win) ? 0.0f : -INFINITY;
-                sa_sw_data[off] = ggml_fp32_to_fp16(sw_val);
-
-                float pad_val    = real_pos ? 0.0f : -INFINITY;
-                sa_pad_data[off] = ggml_fp32_to_fp16(pad_val);
+                sa_sw_data[off] = ggml_fp32_to_fp16(in_win ? 0.0f : -INFINITY);
             }
         }
         if (batch_cfg) {
             memcpy(&sa_sw_data[(N + b) * S * S], &sa_sw_data[b * S * S], S * S * sizeof(uint16_t));
-            memcpy(&sa_pad_data[(N + b) * S * S], &sa_pad_data[b * S * S], S * S * sizeof(uint16_t));
         }
     }
     ggml_backend_tensor_set(t_sa_mask_sw, sa_sw_data.data(), 0, S * S * N_graph * sizeof(uint16_t));
-    ggml_backend_tensor_set(t_sa_mask_pad, sa_pad_data.data(), 0, S * S * N_graph * sizeof(uint16_t));
 
     // Cross-attention mask: per-batch encoder padding.
     // [ne0=enc_S (KV), ne1=S (Q), 1, N_graph] blocks padding in enc_hidden.
@@ -460,7 +449,6 @@ static int dit_ggml_generate(DiTGGML *           model,
         ggml_backend_tensor_set(t_enc, enc_buf.data(), 0, enc_buf.size() * sizeof(float));
         ggml_backend_tensor_set(t_pos, pos_data.data(), 0, S * N_graph * sizeof(int32_t));
         ggml_backend_tensor_set(t_sa_mask_sw, sa_sw_data.data(), 0, S * S * N_graph * sizeof(uint16_t));
-        ggml_backend_tensor_set(t_sa_mask_pad, sa_pad_data.data(), 0, S * S * N_graph * sizeof(uint16_t));
         ggml_backend_tensor_set(t_ca_mask, ca_data.data(), 0, enc_S * S * N_graph * sizeof(uint16_t));
 
         // Update xt portion of input: [in_ch, T, N_graph] (context_latents pre-filled)
@@ -568,7 +556,6 @@ static int dit_ggml_generate(DiTGGML *           model,
             }
             ggml_backend_tensor_set(t_pos, pos_data.data(), 0, S * N * sizeof(int32_t));
             ggml_backend_tensor_set(t_sa_mask_sw, sa_sw_data.data(), 0, S * S * N * sizeof(uint16_t));
-            ggml_backend_tensor_set(t_sa_mask_pad, sa_pad_data.data(), 0, S * S * N * sizeof(uint16_t));
             ggml_backend_tensor_set(t_ca_mask, ca_data.data(), 0, enc_S * S * N * sizeof(uint16_t));
 
             ggml_backend_sched_graph_compute(model->sched, gf);

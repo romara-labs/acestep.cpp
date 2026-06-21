@@ -51,7 +51,7 @@ int ops_build_context(const AceSynth * ctx, const AceRequest * reqs, int batch_n
 // Build silence context + cover_steps for audio_cover_strength switching.
 void ops_build_context_silence(const AceSynth * ctx, int batch_n, SynthState & s);
 
-// Init noise tensor (Philox) + cover noise blend + per_S.
+// Init noise tensor (Philox) + cover noise blend.
 void ops_init_noise(const AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthState & s);
 
 // Run the DiT denoising loop.

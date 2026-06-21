@@ -361,7 +361,7 @@ static struct ggml_tensor * dit_ggml_build_cross_attn(struct ggml_context * ctx,
 // Build one full DiT layer (AdaLN + self-attn + cross-attn + FFN + gated residuals)
 // hidden: [H, S, N], tproj: [6H] (combined timestep projection)
 // enc: [H, enc_S, N] (condition-embedded encoder states, or NULL to skip cross-attn)
-// sa_mask: [S, S, 1, N] self-attention mask (sliding window + padding), or NULL
+// sa_mask: [S, S, 1, N] self-attention sliding window mask, or NULL (full attention)
 // ca_mask: [enc_S, S, 1, N] cross-attention mask (encoder padding), or NULL
 // Returns: updated hidden [H, S, N]
 static struct ggml_tensor * dit_ggml_build_layer(struct ggml_context * ctx,
@@ -409,7 +409,7 @@ static struct ggml_tensor * dit_ggml_build_layer(struct ggml_context * ctx,
         ggml_set_output(norm_sa);
     }
 
-    // sa_mask is pre-selected by the caller (sw+padding for layer_type=0, padding-only for layer_type=1)
+    // sa_mask is pre-selected by the caller (sliding window for layer_type=0, NULL for layer_type=1)
     struct ggml_tensor * sa_out = dit_ggml_build_self_attn(ctx, m, ly, norm_sa, positions, sa_mask, S, N, layer_idx);
 
     if (layer_idx == 0) {
@@ -457,8 +457,7 @@ static struct ggml_tensor * dit_ggml_build_layer(struct ggml_context * ctx,
 //   "t"               [1] f32              flow matching timestep (shared)
 //   "t_r"             [1] f32              reference timestep (shared)
 //   "positions"       [S*N] i32            position indices 0..S-1 repeated N times
-//   "sa_mask_sw"      [S, S, 1, N] f16     self-attn, sw + padding  (ne0=KV, ne1=Q)
-//   "sa_mask_pad"     [S, S, 1, N] f16     self-attn, padding only  (ne0=KV, ne1=Q)
+//   "sa_mask_sw"      [S, S, 1, N] f16     self-attn sliding window (ne0=KV, ne1=Q)
 //   "ca_mask"         [enc_S, S, 1, N] f16 cross-attn, enc padding  (ne0=KV, ne1=Q)
 //
 // Graph outputs:
@@ -516,18 +515,14 @@ static struct ggml_cgraph * dit_ggml_build_graph(DiTGGML *             m,
     // Must be 4D: CUDA flash_attn_mask_to_KV_max offsets by batch*nb[3],
     // so ne[3] must equal N.
     //
-    // sa_mask_sw:  [S, S, 1, N]      self-attn, layer_type=0 (sliding window + padding)
-    // sa_mask_pad: [S, S, 1, N]      self-attn, layer_type=1 (full attn, padding only)
+    // sa_mask_sw:  [S, S, 1, N]      self-attn sliding window (layer_type=0)
     // ca_mask:     [enc_S, S, 1, N]  cross-attn (encoder padding)
     //
-    // When all batch elements have the same T, padding is all 0.0 (no-op).
+    // Full-attention layers (layer_type=1) run unmasked: the batch shares one T,
+    // so there is no temporal padding to block.
     struct ggml_tensor * sa_mask_sw = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, S, S, 1, N);
     ggml_set_name(sa_mask_sw, "sa_mask_sw");
     ggml_set_input(sa_mask_sw);
-
-    struct ggml_tensor * sa_mask_pad = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, S, S, 1, N);
-    ggml_set_name(sa_mask_pad, "sa_mask_pad");
-    ggml_set_input(sa_mask_pad);
 
     struct ggml_tensor * ca_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, enc_S, S, 1, N);
     ggml_set_name(ca_mask, "ca_mask");
@@ -576,8 +571,8 @@ static struct ggml_cgraph * dit_ggml_build_graph(DiTGGML *             m,
 
     // 4) Transformer layers
     for (int i = 0; i < c.n_layers; i++) {
-        // layer_type=0 (sliding window): sa_mask_sw, layer_type=1 (full): sa_mask_pad
-        struct ggml_tensor * sa_mask = (m->layers[i].layer_type == 0) ? sa_mask_sw : sa_mask_pad;
+        // layer_type=0 (sliding window): sa_mask_sw, layer_type=1 (full): unmasked
+        struct ggml_tensor * sa_mask = (m->layers[i].layer_type == 0) ? sa_mask_sw : nullptr;
         hidden = dit_ggml_build_layer(ctx, m, i, hidden, tproj, enc, positions, sa_mask, ca_mask, S, enc_S, N);
         // Debug dumps at key layers: 0, 6, 12, 18, last
         if (i == 0 || i == 6 || i == 12 || i == 18 || i == c.n_layers - 1) {
