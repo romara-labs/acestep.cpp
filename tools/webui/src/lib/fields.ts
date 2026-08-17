@@ -47,6 +47,8 @@ export const FIELDS: readonly FieldDef[] = [
 	// flow matching: cleared by Clear flow matching, preserved across Compose
 	{ key: 'inference_steps', section: 'flow', type: 'num' },
 	{ key: 'guidance_scale', section: 'flow', type: 'num' },
+	{ key: 'lm_cfg', section: 'flow', type: 'num' },
+	{ key: 'dit_cfg', section: 'flow', type: 'num' },
 	{ key: 'shift', section: 'flow', type: 'num' },
 	{ key: 'audio_cover_strength', section: 'flow', type: 'num' },
 	{ key: 'cover_noise_strength', section: 'flow', type: 'num' },

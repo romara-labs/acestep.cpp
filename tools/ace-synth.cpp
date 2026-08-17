@@ -5,6 +5,7 @@
 // under --models <dir> and --adapters <dir>.
 
 #include "audio-io.h"
+#include "mm3-pipeline.h"
 #include "model-registry.h"
 #include "model-store.h"
 #include "pipeline-synth.h"
@@ -25,9 +26,11 @@ static void usage(const char * prog) {
 
     fprintf(stderr, "acestep.cpp %s\n\n", ACE_VERSION);
     fprintf(stderr,
-            "Usage: %s --models <dir> --request <json...> [options]\n\n"
+            "Usage: %s --models <dir> --request <json...> [options]\n"
+            "       %s --models <dir> --caption <text> --lyrics <text> [options]   (MiniMax Music 3)\n\n"
             "Required:\n"
-            "  --models <dir>          Directory of GGUF model files\n"
+            "  --models <dir>          Directory of model files. Scanned flat and in the\n"
+            "                          ComfyUI subdirs text_encoders/ diffusion_models/ vae/\n"
             "  --request <json...>     One or more request JSONs (from ace-lm --request)\n\n"
             "Optional:\n"
             "  --adapters <dir>        Directory of adapter files (enables JSON adapter field)\n"
@@ -35,13 +38,141 @@ static void usage(const char * prog) {
             "  --ref-audio <path>      Timbre reference audio (WAV or MP3)\n\n"
             "Memory control:\n"
             "  --vae-chunk <N>         Latent frames per tile (default: %d)\n"
-            "  --vae-overlap <N>       Overlap frames per side (default: %d)\n\n"
+            "  --vae-overlap <N>       Overlap frames per side (default: %d)\n"
+            "  --keep-loaded           Never evict modules between stages\n\n"
+            "MiniMax Music 3 (used when the resolved diffusion model is minimax_music3):\n"
+            "  --caption <text>        Style prompt, builds a request without a JSON file\n"
+            "  --lyrics <text>         Lyrics, same\n"
+            "  --out <path>            Output file (default out.mp3). Also overrides the\n"
+            "                          --request basename; extension picks mp3 vs wav\n"
+            "  --duration <sec>        Target length (default 60, max 360)\n"
+            "  --steps <N>             Euler steps per DiT window (default %d)\n"
+            "  --seed <N>              DiT noise seed (-1 = random)\n"
+            "  --lm-seed <N>           AR sampling seed (-1 = random)\n"
+            "  --lm-cfg <F>            AR logit CFG scale (default 1.5)\n"
+            "  --dit-cfg <F>           DiT velocity CFG scale (default 1.7)\n"
+            "  --lm-top-k <N>          AR top-k (default %d)\n"
+            "  --max-seq <N>           Cap the LM KV cache (default prompt + frames + 1)\n"
+            "  --ar-backend <dev>      Run the AR stage (LM + depth) on this device\n"
+            "  --synth-backend <dev>   Run synthesis (DiT + VAE) on this device\n"
+            "  --hybrid                Shorthand for --ar-backend ROCm0 --synth-backend Vulkan0\n"
+            "                          (opt-in: needs a binary built with both backends)\n\n"
             "Debug:\n"
             "  --no-fa                 Disable flash attention\n"
             "  --no-batch-cfg          Split DiT CFG into two separate forwards\n"
             "  --clamp-fp16            Clamp hidden states to FP16 range\n"
             "  --dump <dir>            Dump intermediate tensors\n",
-            prog, d.vae_chunk, d.vae_overlap);
+            prog, prog, d.vae_chunk, d.vae_overlap, MM3_DEFAULT_STEPS, MM3_DEFAULT_TOP_K);
+}
+
+// Pick the request output_format from an --out path extension.
+static bool out_format_from_path(const char * path, std::string & format) {
+    std::string p   = path;
+    size_t      dot = p.rfind('.');
+    if (dot == std::string::npos) {
+        return false;
+    }
+    std::string ext = p.substr(dot);
+    if (ext == ".mp3") {
+        format = "mp3";
+        return true;
+    }
+    if (ext == ".wav") {
+        // keep whatever bit depth the request already asks for
+        if (format != "wav16" && format != "wav24" && format != "wav32") {
+            format = "wav16";
+        }
+        return true;
+    }
+    return false;
+}
+
+// MiniMax Music 3 run: resolve the trio from the MM3 registry buckets,
+// generate every request, write the tracks plus their replay JSON.
+static int run_mm3(const ModelRegistry &            registry,
+                   std::vector<AceRequest> &        reqs,
+                   const std::vector<std::string> & basenames,
+                   const MM3PipelineParams &        params,
+                   EvictPolicy                      policy) {
+    // Caller guarantees the three buckets are non-empty; a named model that
+    // does not resolve is the only failure left.
+    const ModelEntry * lm_entry  = &registry.mm3_lm.front();
+    const ModelEntry * dit_entry = reqs[0].synth_model.empty() ?
+                                       &registry.mm3_dit.front() :
+                                       registry_find(registry.mm3_dit, reqs[0].synth_model.c_str());
+    const ModelEntry * vae_entry =
+        reqs[0].vae.empty() ? &registry.mm3_vae.front() : registry_find(registry.mm3_vae, reqs[0].vae.c_str());
+    if (!dit_entry || !vae_entry) {
+        fprintf(stderr, "[MM3-Synth] FATAL: requested model name not found in the MiniMax Music 3 registry\n");
+        return 1;
+    }
+
+    MM3ModelPaths paths;
+    paths.lm  = lm_entry->path;
+    paths.dit = dit_entry->path;
+    paths.vae = vae_entry->path;
+    fprintf(stderr, "[MM3-Synth] LM  %s\n[MM3-Synth] DiT %s\n[MM3-Synth] VAE %s\n", paths.lm.c_str(), paths.dit.c_str(),
+            paths.vae.c_str());
+
+    ModelStore * store = store_create(policy);
+    MM3Pipeline  pipe;
+    pipe.store = store;
+    mm3_pipeline_configure(&pipe, paths, params);
+
+    int rc = 0;
+    for (size_t ri = 0; ri < reqs.size() && rc == 0; ri++) {
+        AceRequest & req = reqs[ri];
+        request_resolve_seed(&req);
+        request_resolve_lm_seed(&req);
+
+        bool      is_mp3  = true;
+        WavFormat wav_fmt = WAV_S16;
+        if (!audio_parse_format(req.output_format.c_str(), is_mp3, wav_fmt)) {
+            fprintf(stderr, "[MM3-Synth] FATAL: invalid output_format '%s'\n", req.output_format.c_str());
+            rc = 1;
+            break;
+        }
+
+        std::vector<std::vector<float>> tracks;
+        std::vector<std::string>        codes;
+        MM3PipelineStatus               st = mm3_pipeline_generate(&pipe, req, nullptr, tracks, &codes);
+        if (st != MM3_PIPELINE_OK) {
+            fprintf(stderr, "[MM3-Synth] ERROR: generation failed (status %d)\n", (int) st);
+            rc = 1;
+            break;
+        }
+
+        const int M = req.synth_batch_size < 1 ? 1 : (req.synth_batch_size > 9 ? 9 : req.synth_batch_size);
+        for (size_t i = 0; i < tracks.size(); i++) {
+            const char * ext = is_mp3 ? ".mp3" : ".wav";
+            char         track_path[1024];
+            snprintf(track_path, sizeof(track_path), "%s%d%s", basenames[ri].c_str(), (int) i, ext);
+            int T_audio = (int) (tracks[i].size() / 2);
+            if (!audio_write(track_path, tracks[i].data(), T_audio, MM3_SAMPLE_RATE, req.mp3_bitrate, wav_fmt,
+                             req.peak_clip)) {
+                fprintf(stderr, "[MM3-Synth] FATAL: failed to write %s\n", track_path);
+                rc = 1;
+                break;
+            }
+            fprintf(stderr, "[MM3-Synth] Wrote %s (%.1fs)\n", track_path, (float) T_audio / MM3_SAMPLE_RATE);
+
+            // Replay card: the same request pinned to the codes and the two
+            // seeds this track actually consumed.
+            AceRequest replay       = req;
+            replay.audio_codes      = codes[i / (size_t) M];
+            replay.lm_seed          = req.lm_seed + (int64_t) (i / (size_t) M);
+            replay.seed             = req.seed + (int64_t) (i % (size_t) M);
+            replay.lm_batch_size    = 1;
+            replay.synth_batch_size = 1;
+            std::string json_path   = std::string(track_path);
+            size_t      dot         = json_path.rfind('.');
+            json_path               = (dot != std::string::npos ? json_path.substr(0, dot) : json_path) + ".json";
+            request_write(&replay, json_path.c_str());
+        }
+    }
+
+    store_free(store);
+    return rc;
 }
 
 int main(int argc, char ** argv) {
@@ -64,11 +195,64 @@ int main(int argc, char ** argv) {
     bool                      use_fa         = true;
     bool                      use_batch_cfg  = true;
     bool                      clamp_fp16     = false;
+    bool                      keep_loaded    = false;
     int                       vae_chunk      = params.vae_chunk;
     int                       vae_overlap    = params.vae_overlap;
 
+    // Flag-built request (MiniMax Music 3 convenience path). cli_req stays
+    // unused unless --caption or --lyrics is given.
+    AceRequest cli_req;
+    request_init(&cli_req);
+    bool         have_cli_req  = false;
+    const char * cli_out_path  = "out.mp3";
+    bool         cli_out_given = false;
+    int          max_seq       = 0;
+    const char * ar_backend    = nullptr;
+    const char * synth_backend = nullptr;
+
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--request")) {
+        if (!strcmp(argv[i], "--caption") && i + 1 < argc) {
+            cli_req.caption = argv[++i];
+            have_cli_req    = true;
+        } else if (!strcmp(argv[i], "--lyrics") && i + 1 < argc) {
+            cli_req.lyrics = argv[++i];
+            have_cli_req   = true;
+        } else if (!strcmp(argv[i], "--out") && i + 1 < argc) {
+            cli_out_path  = argv[++i];
+            cli_out_given = true;
+        } else if (!strcmp(argv[i], "--duration") && i + 1 < argc) {
+            cli_req.duration = (float) atof(argv[++i]);
+            have_cli_req     = true;
+        } else if (!strcmp(argv[i], "--steps") && i + 1 < argc) {
+            cli_req.inference_steps = atoi(argv[++i]);
+            have_cli_req            = true;
+        } else if (!strcmp(argv[i], "--seed") && i + 1 < argc) {
+            cli_req.seed = atoll(argv[++i]);
+            have_cli_req = true;
+        } else if (!strcmp(argv[i], "--lm-seed") && i + 1 < argc) {
+            cli_req.lm_seed = atoll(argv[++i]);
+            have_cli_req    = true;
+        } else if (!strcmp(argv[i], "--lm-cfg") && i + 1 < argc) {
+            cli_req.lm_cfg = (float) atof(argv[++i]);
+            have_cli_req   = true;
+        } else if (!strcmp(argv[i], "--dit-cfg") && i + 1 < argc) {
+            cli_req.dit_cfg = (float) atof(argv[++i]);
+            have_cli_req    = true;
+        } else if (!strcmp(argv[i], "--lm-top-k") && i + 1 < argc) {
+            cli_req.lm_top_k = atoi(argv[++i]);
+            have_cli_req     = true;
+        } else if (!strcmp(argv[i], "--max-seq") && i + 1 < argc) {
+            max_seq = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--ar-backend") && i + 1 < argc) {
+            ar_backend = argv[++i];
+        } else if (!strcmp(argv[i], "--synth-backend") && i + 1 < argc) {
+            synth_backend = argv[++i];
+        } else if (!strcmp(argv[i], "--hybrid")) {
+            ar_backend    = "ROCm0";
+            synth_backend = "Vulkan0";
+        } else if (!strcmp(argv[i], "--keep-loaded")) {
+            keep_loaded = true;
+        } else if (!strcmp(argv[i], "--request")) {
             // Collect all following non-option args
             while (i + 1 < argc && argv[i + 1][0] != '-') {
                 request_paths.push_back(argv[++i]);
@@ -108,35 +292,67 @@ int main(int argc, char ** argv) {
         usage(argv[0]);
         return 1;
     }
-    if (request_paths.empty()) {
-        fprintf(stderr, "[CLI] ERROR: --request required\n");
+    if (request_paths.empty() && !have_cli_req) {
+        fprintf(stderr, "[CLI] ERROR: --request required (or --caption/--lyrics for MiniMax Music 3)\n");
         usage(argv[0]);
         return 1;
     }
 
     // Parse all requests first: the first request drives model selection.
-    int                      batch_n = (int) request_paths.size();
-    std::vector<AceRequest>  reqs(batch_n);
-    std::vector<std::string> basenames(batch_n);
-    for (int ri = 0; ri < batch_n; ri++) {
-        const char * rpath = request_paths[ri];
-        if (!request_parse(&reqs[ri], rpath)) {
-            fprintf(stderr, "[Ace-Synth] FATAL: failed to parse %s\n", rpath);
-            return 1;
-        }
-        request_dump(&reqs[ri], stderr);
-        if (reqs[ri].caption.empty() && reqs[ri].task_type != TASK_LEGO && reqs[ri].task_type != TASK_EXTRACT &&
-            reqs[ri].task_type != TASK_COMPLETE) {
-            fprintf(stderr, "[Ace-Synth] FATAL: caption is empty in %s\n", rpath);
-            return 1;
-        }
-        // output basename: strip .json suffix
-        basenames[ri] = rpath;
-        size_t dot    = basenames[ri].rfind(".json");
+    // With no --request, the flags built one and the output name comes from
+    // --out instead of a JSON path.
+    std::vector<AceRequest>  reqs;
+    std::vector<std::string> basenames;
+    if (request_paths.empty()) {
+        reqs.push_back(cli_req);
+        std::string base = cli_out_path;
+        size_t      dot  = base.rfind('.');
         if (dot != std::string::npos) {
-            basenames[ri] = basenames[ri].substr(0, dot);
+            base = base.substr(0, dot);
+        }
+        basenames.push_back(base);
+        if (!out_format_from_path(cli_out_path, reqs[0].output_format)) {
+            fprintf(stderr, "[Ace-Synth] FATAL: --out must end in .mp3 or .wav\n");
+            return 1;
+        }
+    } else {
+        reqs.resize(request_paths.size());
+        basenames.resize(request_paths.size());
+        for (size_t ri = 0; ri < request_paths.size(); ri++) {
+            const char * rpath = request_paths[ri];
+            if (!request_parse(&reqs[ri], rpath)) {
+                fprintf(stderr, "[Ace-Synth] FATAL: failed to parse %s\n", rpath);
+                return 1;
+            }
+            request_dump(&reqs[ri], stderr);
+            // output basename: strip .json suffix
+            basenames[ri] = rpath;
+            size_t dot    = basenames[ri].rfind(".json");
+            if (dot != std::string::npos) {
+                basenames[ri] = basenames[ri].substr(0, dot);
+            }
+        }
+        // An explicit --out wins over the JSON basename for every request,
+        // otherwise it is silently ignored and the run overwrites whatever
+        // the request path maps to. Its extension also picks the format,
+        // same as the flag-built path.
+        if (cli_out_given) {
+            std::string base = cli_out_path;
+            size_t      dot  = base.rfind('.');
+            if (dot != std::string::npos) {
+                base = base.substr(0, dot);
+            }
+            for (size_t ri = 0; ri < request_paths.size(); ri++) {
+                basenames[ri] = base;
+            }
+            if (!out_format_from_path(cli_out_path, reqs[0].output_format)) {
+                fprintf(stderr, "[Ace-Synth] FATAL: --out must end in .mp3 or .wav\n");
+                return 1;
+            }
+            fprintf(stderr, "[Ace-Synth] --out overrides basename for %zu request(s)\n", reqs.size());
         }
     }
+    int batch_n = (int) reqs.size();
     fprintf(stderr, "[Ace-Synth] Batch: %d request(s)\n", batch_n);
 
     // Scan the registry and resolve model paths from the first request.
@@ -147,6 +363,56 @@ int main(int argc, char ** argv) {
     }
     if (adapters_dir) {
         registry_scan_adapters(&registry, adapters_dir);
+    }
+
+    // Architecture dispatch. A synth_model naming an MM3 diffusion GGUF
+    // picks MiniMax Music 3 explicitly; otherwise MM3 is used only when the
+    // registry has a complete MM3 set and no ACE-Step DiT, so a directory
+    // holding both keeps resolving to ACE-Step exactly as before.
+    bool use_mm3 = false;
+    if (!reqs[0].synth_model.empty()) {
+        use_mm3 = registry_find(registry.mm3_dit, reqs[0].synth_model.c_str()) != nullptr;
+    } else {
+        use_mm3 = registry.dit.empty() && registry_has_mm3(registry);
+    }
+
+    if (use_mm3) {
+        if (!registry_has_mm3(registry)) {
+            fprintf(stderr,
+                    "[Ace-Synth] FATAL: MiniMax Music 3 needs all three files "
+                    "(text encoder GGUF, diffusion GGUF, DAV safetensors)\n");
+            return 1;
+        }
+        MM3PipelineParams mp;
+        mp.use_fa        = use_fa;
+        mp.use_batch_cfg = use_batch_cfg;
+        mp.clamp_fp16    = clamp_fp16;
+        mp.max_seq       = max_seq;
+        mp.max_batch     = 1;
+        for (const auto & r : reqs) {
+            int n = r.lm_batch_size < 1 ? 1 : r.lm_batch_size;
+            if (n > mp.max_batch) {
+                mp.max_batch = n;
+            }
+        }
+        mp.dump_dir      = dump_dir;
+        mp.ar_backend    = ar_backend;
+        mp.synth_backend = synth_backend;
+        if ((ar_backend || synth_backend) && keep_loaded) {
+            fprintf(stderr,
+                    "[Ace-Synth] WARNING: per-stage backends need eviction between stages; "
+                    "--keep-loaded pins the first device for the whole run\n");
+        }
+        return run_mm3(registry, reqs, basenames, mp, keep_loaded ? EVICT_NEVER : EVICT_STRICT);
+    }
+
+    // ACE-Step path: unchanged from here down.
+    for (int ri = 0; ri < batch_n; ri++) {
+        if (reqs[ri].caption.empty() && reqs[ri].task_type != TASK_LEGO && reqs[ri].task_type != TASK_EXTRACT &&
+            reqs[ri].task_type != TASK_COMPLETE) {
+            fprintf(stderr, "[Ace-Synth] FATAL: caption is empty in request %d\n", ri);
+            return 1;
+        }
     }
     if (registry.dit.empty() || registry.text_enc.empty() || registry.vae.empty()) {
         fprintf(stderr, "[Ace-Synth] FATAL: registry needs DiT, text-encoder and VAE models\n");
@@ -199,7 +465,8 @@ int main(int argc, char ** argv) {
     // Local store with the default STRICT policy: at most one GPU module
     // resident at a time for this one-shot CLI. No module sharing across runs,
     // so EVICT_STRICT frees the DiT before the VAE loads, and so on.
-    ModelStore * store = store_create(EVICT_STRICT);
+    // --keep-loaded trades that for VRAM.
+    ModelStore * store = store_create(keep_loaded ? EVICT_NEVER : EVICT_STRICT);
     AceSynth *   ctx   = ace_synth_load(store, &params);
     if (!ctx) {
         store_free(store);

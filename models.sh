@@ -9,6 +9,7 @@
 #   --sft:      include SFT DiT variant
 #   --base:     include base DiT variant
 #   --shifts:   include shift1/shift3/continuous DiT variants
+#   --mm3:      MiniMax Music 3 instead of ACE-Step (3 files, ComfyUI layout)
 
 set -eu
 
@@ -20,6 +21,7 @@ ALL=0
 SFT=0
 BASE=0
 SHIFTS=0
+MM3=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -29,6 +31,7 @@ while [ $# -gt 0 ]; do
         --sft)    SFT=1 ;;
         --base)   BASE=1 ;;
         --shifts) SHIFTS=1 ;;
+        --mm3)    MM3=1 ;;
         *)        echo "Unknown option: $1"; exit 1 ;;
     esac
     shift
@@ -45,6 +48,55 @@ dl() {
     echo "[Download] $file"
     hf download --quiet "$REPO" "$file" --local-dir "$DIR"
 }
+
+# MiniMax Music 3: three files in the ComfyUI component layout that
+# registry_scan looks for under --models.
+#   text_encoders/    global LM (Qwen3 8B, pruned embeddings) + RVQ depth
+#                     decoder + the embedded HF tokenizer.json
+#   diffusion_models/ flow matching DiT + condition encoder
+#   vae/              DAV decoder (safetensors, weight norm folded at load)
+# The DAV file is the authoritative one from Comfy-Org; the two GGUFs are
+# quantizations of that repo's *_pruned_* / dit safetensors.
+if [ "$MM3" = 1 ]; then
+    MM3_GGUF_REPO="molbal/Minimax-Music3-GGUF"
+    MM3_VAE_REPO="Comfy-Org/MiniMax-Music-3"
+    case "$QUANT" in
+        Q4_0|Q4_K_M) MM3_QUANT="Q4_0" ;;
+        BF16)        MM3_QUANT="BF16" ;;
+        *)           MM3_QUANT="Q8_0" ;;
+    esac
+
+    mkdir -p "$DIR/text_encoders" "$DIR/diffusion_models" "$DIR/vae"
+
+    dl_mm3() {
+        local repo="$1" file="$2" subdir="$3"
+        local base
+        base="$(basename "$file")"
+        if [ -f "$DIR/$subdir/$base" ]; then
+            echo "[OK] $subdir/$base"
+            return
+        fi
+        echo "[Download] $subdir/$base <- $repo"
+        hf download --quiet "$repo" "$file" --local-dir "$DIR/$subdir"
+        # flatten: the vae file arrives under its repo subdirectory
+        if [ "$file" != "$base" ] && [ -f "$DIR/$subdir/$file" ]; then
+            mv "$DIR/$subdir/$file" "$DIR/$subdir/$base"
+        fi
+    }
+
+    # the DiT GGUF ships BF16 rather than Q8_CR at BF16 quant
+    if [ "$MM3_QUANT" = "BF16" ]; then
+        dl_mm3 "$MM3_GGUF_REPO" "minimax_music3_dit_BF16.gguf" "diffusion_models"
+    else
+        dl_mm3 "$MM3_GGUF_REPO" "minimax_music3_dit_${MM3_QUANT}.gguf" "diffusion_models"
+    fi
+    dl_mm3 "$MM3_GGUF_REPO" "minimax_music3_text_encoder_pruned_${MM3_QUANT}.gguf" "text_encoders"
+    dl_mm3 "$MM3_VAE_REPO" "vae/minimax_music3_dav.safetensors" "vae"
+
+    echo "[Done] MiniMax Music 3 ready in $DIR/"
+    echo "[Done] Run: ./build/ace-synth --models $DIR --caption \"...\" --lyrics \"...\" --out song.mp3"
+    exit 0
+fi
 
 # Resolve quant to best available for each model type.
 # Matches quantize.sh matrix exactly:

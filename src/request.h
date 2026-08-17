@@ -45,9 +45,17 @@ struct AceRequest {
     std::string audio_codes;  // ""
 
     // DiT control (0 = auto-detect from model: turbo vs base/sft)
-    int   inference_steps;  // 0 = auto (turbo: 8, base/sft: 50)
+    int   inference_steps;  // 0 = auto (turbo: 8, base/sft: 50, MiniMax Music 3: 30)
     float guidance_scale;   // 0 = auto (1.0 for all models)
     float shift;            // 0 = auto (turbo: 3.0, base/sft: 1.0)
+
+    // MiniMax Music 3 guidance. Read only when the resolved diffusion model
+    // is minimax_music3; the ACE-Step path never looks at them. Split from
+    // lm_cfg_scale / guidance_scale because the MM3 recipe defaults differ
+    // (1.5 on the AR logits, 1.7 on the DiT velocity) and mixing them would
+    // silently retune whichever pipeline did not set the field.
+    float lm_cfg;   // 1.5, CFG scale on the LM and depth decoder logits
+    float dit_cfg;  // 1.7, CFG scale on the DiT velocity field
 
     // Differential Correction in Wavelet domain (CVPR 2026, arXiv:2604.16044).
     // Sampler-side correction for SNR-t bias in flow matching.

@@ -24,6 +24,27 @@ Multiple DiT variants: turbo (8 steps), sft (50 steps, higher quality), base, sh
 
 Alternative: `./models.sh` downloads the default set automatically (needs `pip install hf`).
 
+### MiniMax Music 3
+
+The same binaries also run [MiniMax Music 3](docs/MINIMAX-MUSIC-3.md), selected
+automatically when the resolved diffusion model is one. Three files, in the
+ComfyUI component layout under `models/`:
+
+| Type | File | Size |
+|------|------|------|
+| Text encoder (LM + depth + tokenizer) | text_encoders/minimax_music3_text_encoder_pruned_Q8_0.gguf | 8.9 GB |
+| Diffusion (DiT + condition encoder) | diffusion_models/minimax_music3_dit_Q8_0.gguf | 2.7 GB |
+| VAE decoder | vae/minimax_music3_dav.safetensors | 217 MB |
+
+`./models.sh --mm3` downloads that set. Output is 44.1 kHz stereo, text to
+music only (no cover, repaint, or audio conditioning).
+
+```
+./build/ace-synth --models models --caption "warm lo-fi hip hop" \
+    --lyrics "[verse]
+city lights are fading slow" --duration 30 --out song.mp3
+```
+
 ## Build
 
 ```

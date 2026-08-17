@@ -29,6 +29,7 @@
 //   /understand LM + DiT + VAE
 
 #include "audio-io.h"
+#include "mm3-pipeline.h"
 #include "model-registry.h"
 #include "model-store.h"
 #include "pipeline-lm.h"
@@ -699,6 +700,97 @@ static void handle_lm(const httplib::Request & req, httplib::Response & res) {
     res.set_content(body, "application/json");
 }
 
+// Architecture dispatch for a synth request. A synth_model naming an MM3
+// diffusion GGUF picks MiniMax Music 3 explicitly; otherwise MM3 is used
+// only when the registry has a complete MM3 set and no ACE-Step DiT, so a
+// directory holding both keeps resolving to ACE-Step exactly as before.
+static bool server_use_mm3(const AceRequest & r) {
+    if (!registry_has_mm3(g_registry)) {
+        return false;
+    }
+    if (!r.synth_model.empty()) {
+        return registry_find(g_registry.mm3_dit, r.synth_model.c_str()) != nullptr;
+    }
+    return g_registry.dit.empty();
+}
+
+// MiniMax Music 3 synth worker. Text to music only: there is no encoder in
+// the DAV checkpoint, so source and reference audio do not apply, and the
+// latent parts of the multipart response stay empty (the MM3 latent is
+// 128 ch at 86.13 Hz and cannot be fed back to the ACE-Step /vae endpoint).
+static void mm3_synth_worker(std::shared_ptr<Job>    job,
+                             std::vector<AceRequest> ace_reqs,
+                             bool                    output_wav,
+                             WavFormat               wav_fmt,
+                             int                     peak_clip) {
+    MM3ModelPaths paths;
+    paths.lm               = g_registry.mm3_lm.front().path;
+    const ModelEntry * dit = ace_reqs[0].synth_model.empty() ?
+                                 &g_registry.mm3_dit.front() :
+                                 registry_find(g_registry.mm3_dit, ace_reqs[0].synth_model.c_str());
+    const ModelEntry * vae = ace_reqs[0].vae.empty() ? &g_registry.mm3_vae.front() :
+                                                       registry_find(g_registry.mm3_vae, ace_reqs[0].vae.c_str());
+    if (!dit || !vae) {
+        fprintf(stderr, "[Server] MM3 model not found in registry\n");
+        job->status.store(JobStatus::FAILED);
+        return;
+    }
+    paths.dit = dit->path;
+    paths.vae = vae->path;
+
+    MM3PipelineParams mp;
+    mp.use_fa        = g_synth_params.use_fa;
+    mp.use_batch_cfg = g_synth_params.use_batch_cfg;
+    mp.clamp_fp16    = g_synth_params.clamp_fp16;
+    mp.max_seq       = 0;  // prompt + frames + 1
+    mp.max_batch     = g_max_batch;
+
+    MM3Pipeline pipe;
+    pipe.store = g_store;
+    mm3_pipeline_configure(&pipe, paths, mp);
+
+    std::vector<std::string>        encoded;
+    std::vector<std::vector<float>> empty_latents;
+    const char *                    mime = output_wav ? "audio/wav" : "audio/mpeg";
+
+    for (auto & req : ace_reqs) {
+        if (job->cancel.load()) {
+            job->status.store(JobStatus::CANCELLED);
+            return;
+        }
+        std::vector<std::vector<float>> tracks;
+        std::vector<std::string>        codes;
+        MM3PipelineStatus               st = mm3_pipeline_generate(&pipe, req, &job->cancel, tracks, &codes);
+        if (st == MM3_PIPELINE_CANCELLED) {
+            job->status.store(JobStatus::CANCELLED);
+            return;
+        }
+        if (st != MM3_PIPELINE_OK) {
+            fprintf(stderr, "[Server] MM3 generation failed\n");
+            job->status.store(JobStatus::FAILED);
+            return;
+        }
+        for (auto & track : tracks) {
+            int T_audio = (int) (track.size() / 2);
+            if (!output_wav || wav_fmt != WAV_F32) {
+                audio_normalize(track.data(), T_audio * 2, peak_clip);
+            }
+            if (output_wav) {
+                encoded.push_back(audio_encode_wav(track.data(), T_audio, MM3_SAMPLE_RATE, wav_fmt));
+            } else {
+                encoded.push_back(audio_encode_mp3(track.data(), T_audio, MM3_SAMPLE_RATE, req.mp3_bitrate,
+                                                   server_cancel_job, (void *) &job->cancel));
+            }
+            empty_latents.emplace_back();
+        }
+    }
+
+    job->result_body = multipart_build_audio_latent(encoded, mime, empty_latents);
+    job->result_mime = MULTIPART_MIME;
+    job->status.store(job->cancel.load() ? JobStatus::CANCELLED : JobStatus::DONE);
+    fprintf(stderr, "[Server] Job %s done (MM3, %zu tracks)\n", job->id.c_str(), encoded.size());
+}
+
 // synth worker: processes synth request, stores audio result in job.
 static void synth_worker(std::shared_ptr<Job>    job,
                          std::vector<AceRequest> ace_reqs,
@@ -713,6 +805,18 @@ static void synth_worker(std::shared_ptr<Job>    job,
                          bool                    output_wav,
                          WavFormat               wav_fmt,
                          int                     peak_clip) {
+    // MiniMax Music 3 takes its own path: different modules, different
+    // sample rate, no audio conditioning.
+    if (server_use_mm3(ace_reqs[0])) {
+        if (src_interleaved || ref_interleaved || !src_latents.empty() || !ref_latents.empty()) {
+            fprintf(stderr, "[Server] MM3 is text to music only: source and reference inputs ignored\n");
+        }
+        free(src_interleaved);
+        free(ref_interleaved);
+        mm3_synth_worker(job, std::move(ace_reqs), output_wav, wav_fmt, peak_clip);
+        return;
+    }
+
     // Generate every request in one DiT batch. synth_batch_size expands each
     // request into per-seed variants. Total clamped to DiT max 9.
     const int batch_n     = (int) ace_reqs.size();
@@ -912,8 +1016,11 @@ static void synth_worker(std::shared_ptr<Job>    job,
 // Batch size = number of JSON objects (after synth_batch_size expansion, clamped to 9).
 // Metadata (seed, duration, etc) is already in the request JSON from /lm.
 static void handle_synth(const httplib::Request & req, httplib::Response & res) {
-    if (g_registry.dit.empty() || g_registry.text_enc.empty() || g_registry.vae.empty()) {
-        json_error(res, 501, "No synth models in registry (need dit + text-encoder + vae)");
+    const bool have_ace = !g_registry.dit.empty() && !g_registry.text_enc.empty() && !g_registry.vae.empty();
+    if (!have_ace && !registry_has_mm3(g_registry)) {
+        json_error(res, 501,
+                   "No synth models in registry (need ACE-Step dit + text-encoder + vae, "
+                   "or the MiniMax Music 3 trio)");
         return;
     }
 
@@ -1544,6 +1651,11 @@ static void handle_props(const httplib::Request &, httplib::Response & res) {
     add_names(models, "embedding", g_registry.text_enc);
     add_names(models, "dit", g_registry.dit);
     add_names(models, "vae", g_registry.vae);
+    // MiniMax Music 3 buckets, so a client can tell which architecture the
+    // server can serve and pin a model by name in synth_model / vae.
+    add_names(models, "mm3_lm", g_registry.mm3_lm);
+    add_names(models, "mm3_dit", g_registry.mm3_dit);
+    add_names(models, "mm3_vae", g_registry.mm3_vae);
 
     // adapters: available adapter names
     yyjson_mut_val * adapters_arr = yyjson_mut_arr(doc);

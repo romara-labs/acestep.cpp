@@ -22,6 +22,10 @@ export interface AceRequest {
 	inference_steps?: number;
 	guidance_scale?: number;
 	shift?: number;
+	// MiniMax Music 3 only: separate CFG scales for the AR logits and
+	// the DiT velocity. Ignored on the ACE-Step path.
+	lm_cfg?: number;
+	dit_cfg?: number;
 	dcw_scaler?: number;
 	dcw_high_scaler?: number;
 	dcw_mode?: string;

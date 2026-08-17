@@ -18,7 +18,9 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
 #    include <windows.h>
@@ -229,10 +231,15 @@ static struct ggml_tensor * gf_load_tensor_f32(WeightCtx * wctx, const GGUFModel
         return gf_load_tensor(wctx, gf, name);
     }
 
-    // Bail early on unsupported types (before creating tensor in ctx)
-    if (src->type != GGML_TYPE_BF16 && src->type != GGML_TYPE_F16) {
-        fprintf(stderr, "[GGUF] WARNING: gf_load_tensor_f32 unsupported type %d for '%s', loading as-is\n", src->type,
-                name.c_str());
+    // Bail early on types without a dequantizer (before creating tensor in ctx).
+    // Everything ggml can dequantize is accepted, not just BF16/F16: the
+    // MiniMax Music 3 checkpoints quantize small tensors too (the depth
+    // decoder positional table is Q8_0), and loading those as-is would feed
+    // a quantized operand into ggml_add/ggml_mul, which no backend supports.
+    const struct ggml_type_traits * traits = ggml_get_type_traits(src->type);
+    if (!traits->to_float) {
+        fprintf(stderr, "[GGUF] WARNING: gf_load_tensor_f32 cannot dequantize type %d for '%s', loading as-is\n",
+                src->type, name.c_str());
         return gf_load_tensor(wctx, gf, name);
     }
 
@@ -249,14 +256,7 @@ static struct ggml_tensor * gf_load_tensor_f32(WeightCtx * wctx, const GGUFModel
     size_t       offset = gguf_get_tensor_offset(gf.gguf, idx);
     const void * raw    = gf.mapping + gf.data_offset + offset;
 
-    if (src->type == GGML_TYPE_BF16) {
-        const uint16_t * p = (const uint16_t *) raw;
-        for (size_t i = 0; i < n; i++) {
-            data[i] = ggml_bf16_to_fp32(*(const ggml_bf16_t *) &p[i]);
-        }
-    } else {
-        ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw, data, (int) n);
-    }
+    traits->to_float(raw, data, (int64_t) n);
 
     wctx->pending.push_back({ tensor, data, n * sizeof(float), 0 });
     wctx->staging.push_back(std::move(buf));
@@ -273,6 +273,30 @@ static const void * gf_get_data(const GGUFModel & gf, const char * name) {
     }
     size_t offset = gguf_get_tensor_offset(gf.gguf, idx);
     return gf.mapping + gf.data_offset + offset;
+}
+
+// Read a whole tensor into a host F32 vector (F32 passthrough, everything
+// with a dequantizer converted: BF16, F16, Q8_0, K-quants).
+// Used by loaders that fold weights on the host (MM3 snake alphas, the
+// condition mix, the timestep MLP, the rotary inv_freq table).
+static bool gf_host_f32(const GGUFModel & gf, const std::string & name, std::vector<float> & dst) {
+    struct ggml_tensor * mt  = ggml_get_tensor(gf.meta, name.c_str());
+    const void *         raw = gf_get_data(gf, name.c_str());
+    if (!mt || !raw) {
+        return false;
+    }
+    size_t n = (size_t) ggml_nelements(mt);
+    dst.resize(n);
+    if (mt->type == GGML_TYPE_F32) {
+        memcpy(dst.data(), raw, n * sizeof(float));
+        return true;
+    }
+    const struct ggml_type_traits * traits = ggml_get_type_traits(mt->type);
+    if (!traits->to_float) {
+        return false;
+    }
+    traits->to_float(raw, dst.data(), (int64_t) n);
+    return true;
 }
 
 // Fuse Q, K, V projection weights into a single tensor [ne0, q_ne1 + k_ne1 + v_ne1].

@@ -970,6 +970,22 @@
 					/></label
 				>
 				<label
+					title="MiniMax Music 3 only: CFG on the AR logits"
+					>LM CFG <input
+						type="text"
+						placeholder={ph(d?.lm_cfg)}
+						bind:value={app.request.lm_cfg}
+					/></label
+				>
+				<label
+					title="MiniMax Music 3 only: CFG on the DiT velocity"
+					>DiT CFG <input
+						type="text"
+						placeholder={ph(d?.dit_cfg)}
+						bind:value={app.request.dit_cfg}
+					/></label
+				>
+				<label
 					>Seed <input type="text" placeholder={ph(d?.seed)} bind:value={app.request.seed} /></label
 				>
 			</div>

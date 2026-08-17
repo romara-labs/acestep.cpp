@@ -15,3 +15,10 @@ link_ggml_backends(test-model-store)
 add_executable(test-lm-prompt test-lm-prompt.cpp)
 target_link_libraries(test-lm-prompt PRIVATE acestep-core)
 link_ggml_backends(test-lm-prompt)
+
+# test-mm3: load every MiniMax Music 3 module against the real checkpoint
+# files and assert the empirical fixtures (condition mix, rotary inv_freq,
+# tokenizer vocab). Needs --models pointing at the MM3 files.
+add_executable(test-mm3 test-mm3.cpp)
+target_link_libraries(test-mm3 PRIVATE acestep-core)
+link_ggml_backends(test-mm3)

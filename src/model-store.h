@@ -14,6 +14,17 @@
 //       construction, because only one module is ever loaded. No special
 //       case needed.
 //
+//   coexistence groups (MiniMax Music 3 only)
+//       The MM3 pipeline interleaves modules at a granularity where
+//       evicting between them would thrash, so eviction consults a group
+//       id instead of the bare kind:
+//         AR    = { MM3_LM, MM3_DEPTH }   interleaved per frame
+//         SYNTH = { MM3_DIT, MM3_VAE }    interleaved per window
+//       Every ACE-Step kind is its own singleton group, so the ACE path
+//       keeps exactly the "at most one module" behaviour it has today:
+//       modules of different kinds still evict each other, and two
+//       modules of the same kind with different keys still do too.
+//
 //   invariant held under BOTH policies
 //       Exactly ONE LM instance for the whole process. ace_lm (generate)
 //       and ace_understand must share the same LM: duplicating it would
@@ -50,6 +61,10 @@
 #include "fsq-detok.h"
 #include "fsq-tok.h"
 #include "metadata-fsm.h"
+#include "mm3-depth.h"
+#include "mm3-dit.h"
+#include "mm3-lm.h"
+#include "mm3-vae.h"
 #include "qwen3-enc.h"
 #include "qwen3-lm.h"
 #include "vae-enc.h"
@@ -69,6 +84,14 @@ enum ModelKind {
     MODEL_VAE_DEC,    // VAEGGML        from vae.gguf (decoder.*)
     MODEL_FSQ_TOK,    // TokGGML        from acestep-v15-*.gguf (tokenizer.*)
     MODEL_FSQ_DETOK,  // DetokGGML      from acestep-v15-*.gguf (detokenizer.*)
+
+    // MiniMax Music 3. The LM and the depth decoder share one GGUF (the
+    // text encoder file), the DiT and the condition encoder share another,
+    // and the DAV decoder is a safetensors file.
+    MODEL_MM3_LM,     // MM3LM          from minimax_music3_text_encoder_*.gguf
+    MODEL_MM3_DEPTH,  // MM3Depth       from the same text encoder GGUF
+    MODEL_MM3_DIT,    // MM3DiT         from MiniMax-Music3-*.gguf
+    MODEL_MM3_VAE,    // MM3VAE         from minimax_music3_dav.safetensors
 };
 
 struct ModelKey {
@@ -115,6 +138,13 @@ VAEGGML *    store_require_vae_dec(ModelStore * s, const ModelKey & k);
 TokGGML *    store_require_fsq_tok(ModelStore * s, const ModelKey & k);
 DetokGGML *  store_require_fsq_detok(ModelStore * s, const ModelKey & k);
 
+// MiniMax Music 3 modules. MM3_LM reads max_seq / n_kv_sets from the key
+// exactly like MODEL_LM does; the other three ignore the extras.
+MM3LM *    store_require_mm3_lm(ModelStore * s, const ModelKey & k);
+MM3Depth * store_require_mm3_depth(ModelStore * s, const ModelKey & k);
+MM3DiT *   store_require_mm3_dit(ModelStore * s, const ModelKey & k);
+MM3VAE *   store_require_mm3_vae(ModelStore * s, const ModelKey & k);
+
 // Release decrements the refcount for the module behind this handle.
 // Pass exactly the pointer returned by require. After release, the pointer
 // must not be used: in EVICT_STRICT it may be unloaded immediately.
@@ -123,6 +153,9 @@ void store_release(ModelStore * s, void * handle);
 // CPU-resident accessors. Loaded on first call, kept forever, never evicted.
 // All small (a few MB total). Return NULL on load failure.
 BPETokenizer *  store_bpe(ModelStore * s, const char * lm_path);
+// MM3 tokenizer: same cache, but built from the `tokenizer_json` tensor of
+// the MM3 text encoder GGUF instead of tokenizer.ggml.tokens/merges KVs.
+BPETokenizer *  store_mm3_bpe(ModelStore * s, const char * lm_path);
 const float *   store_silence(ModelStore * s, const char * dit_path);
 MetadataFSM *   store_fsm(ModelStore * s, const char * lm_path, int vocab_size);
 const DiTMeta * store_dit_meta(ModelStore * s, const char * dit_path);

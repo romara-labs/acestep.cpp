@@ -427,6 +427,268 @@ static bool load_bpe_from_gguf(BPETokenizer * tok, const char * gguf_path) {
     return true;
 }
 
+// HuggingFace tokenizer.json loader (MiniMax Music 3)
+//
+// The MM3 text encoder GGUF ships the whole HF tokenizer.json as an I8
+// tensor instead of tokenizer.ggml.tokens/merges KVs, so the BPE tables
+// are scanned straight out of that blob. Structure consumed:
+//   "model": { "type": "BPE", "vocab": {tok: id}, "merges": [[a, b], ...] }
+//   "added_tokens": [ {"id": N, "content": "<|...|>"}, ... ]
+// The 32 added tokens (ids 151643..151674) are NOT in model.vocab, so the
+// two tables are merged: 151643 + 32 = 151675 = AUDIO_CODE_OFFSET.
+//
+// Only a scanner is needed, not a general JSON parser: it walks to the
+// known keys and reads the two shapes above. Kept dependency-free so
+// bpe.h stays includable from anywhere.
+
+// Skip spaces, tabs, newlines
+static size_t bpe_json_ws(const char * s, size_t p, size_t n) {
+    while (p < n && (s[p] == ' ' || s[p] == '\t' || s[p] == '\n' || s[p] == '\r')) {
+        p++;
+    }
+    return p;
+}
+
+// Read a JSON string starting at the opening quote, unescaping into out.
+// Returns the position just past the closing quote.
+static size_t bpe_json_str(const char * s, size_t p, size_t n, std::string & out) {
+    out.clear();
+    if (p >= n || s[p] != '"') {
+        return p;
+    }
+    p++;
+    while (p < n && s[p] != '"') {
+        if (s[p] != '\\') {
+            out += s[p++];
+            continue;
+        }
+        p++;
+        if (p >= n) {
+            break;
+        }
+        char c = s[p++];
+        switch (c) {
+            case 'n':
+                out += '\n';
+                break;
+            case 't':
+                out += '\t';
+                break;
+            case 'r':
+                out += '\r';
+                break;
+            case 'b':
+                out += '\b';
+                break;
+            case 'f':
+                out += '\f';
+                break;
+            case 'u':
+                {
+                    // \uXXXX -> UTF-8. Surrogate pairs are not used by the
+                    // byte-level vocab (max codepoint U+0143), so a single
+                    // unit is enough.
+                    int cp = 0;
+                    for (int k = 0; k < 4 && p < n; k++, p++) {
+                        char h = s[p];
+                        int  d = (h >= '0' && h <= '9') ? h - '0' :
+                                 (h >= 'a' && h <= 'f') ? h - 'a' + 10 :
+                                 (h >= 'A' && h <= 'F') ? h - 'A' + 10 :
+                                                          0;
+                        cp     = cp * 16 + d;
+                    }
+                    if (cp < 0x80) {
+                        out += (char) cp;
+                    } else if (cp < 0x800) {
+                        out += (char) (0xC0 | (cp >> 6));
+                        out += (char) (0x80 | (cp & 0x3F));
+                    } else {
+                        out += (char) (0xE0 | (cp >> 12));
+                        out += (char) (0x80 | ((cp >> 6) & 0x3F));
+                        out += (char) (0x80 | (cp & 0x3F));
+                    }
+                    break;
+                }
+            default:
+                out += c;  // covers \" \\ \/
+                break;
+        }
+    }
+    return p < n ? p + 1 : p;
+}
+
+// Find the byte offset of a top-level-ish key: the first occurrence of
+// "<key>" followed by a colon at or after `from`. Returns npos if absent.
+static size_t bpe_json_find_key(const char * s, size_t n, size_t from, const char * key) {
+    std::string needle = std::string("\"") + key + "\"";
+    std::string hay(s + from, n - from);
+    size_t      rel = hay.find(needle);
+    if (rel == std::string::npos) {
+        return std::string::npos;
+    }
+    size_t p = bpe_json_ws(s, from + rel + needle.size(), n);
+    if (p >= n || s[p] != ':') {
+        return std::string::npos;
+    }
+    return bpe_json_ws(s, p + 1, n);
+}
+
+// Load the BPE tables from an in-memory HF tokenizer.json blob.
+// json need not be NUL terminated; len is authoritative.
+static bool load_bpe_from_tokenizer_json(BPETokenizer * tok, const char * json, size_t len) {
+    build_byte_encoder(tok->byte2str);
+    tok->vocab.clear();
+    tok->merges.clear();
+
+    // model.vocab: {"token": id, ...}
+    size_t model_at = bpe_json_find_key(json, len, 0, "model");
+    if (model_at == std::string::npos) {
+        fprintf(stderr, "[BPE] tokenizer.json has no \"model\" object\n");
+        return false;
+    }
+    size_t p = bpe_json_find_key(json, len, model_at, "vocab");
+    if (p == std::string::npos || json[p] != '{') {
+        fprintf(stderr, "[BPE] tokenizer.json has no model.vocab object\n");
+        return false;
+    }
+    p++;
+    std::string key;
+    int         max_id = -1;
+    while (p < len) {
+        p = bpe_json_ws(json, p, len);
+        if (p >= len || json[p] == '}') {
+            p++;
+            break;
+        }
+        if (json[p] == ',') {
+            p++;
+            continue;
+        }
+        p = bpe_json_str(json, p, len, key);
+        p = bpe_json_ws(json, p, len);
+        if (p < len && json[p] == ':') {
+            p++;
+        }
+        p               = bpe_json_ws(json, p, len);
+        char * end      = nullptr;
+        long   id       = strtol(json + p, &end, 10);
+        p               = (size_t) (end - json);
+        tok->vocab[key] = (int) id;
+        if ((int) id > max_id) {
+            max_id = (int) id;
+        }
+    }
+    size_t n_base = tok->vocab.size();
+
+    // model.merges: [["a","b"], ...] -> the "a b" ranked keys bpe_merge wants.
+    // (v1.0 tokenizer.json stores pairs, not the space joined strings.)
+    p = bpe_json_find_key(json, len, model_at, "merges");
+    if (p == std::string::npos || json[p] != '[') {
+        fprintf(stderr, "[BPE] tokenizer.json has no model.merges array\n");
+        return false;
+    }
+    p++;
+    int         rank = 0;
+    std::string a, b;
+    while (p < len) {
+        p = bpe_json_ws(json, p, len);
+        if (p >= len || json[p] == ']') {
+            p++;
+            break;
+        }
+        if (json[p] == ',') {
+            p++;
+            continue;
+        }
+        if (json[p] == '[') {
+            p = bpe_json_str(json, bpe_json_ws(json, p + 1, len), len, a);
+            p = bpe_json_ws(json, p, len);
+            if (p < len && json[p] == ',') {
+                p++;
+            }
+            p = bpe_json_str(json, bpe_json_ws(json, p, len), len, b);
+            p = bpe_json_ws(json, p, len);
+            if (p < len && json[p] == ']') {
+                p++;
+            }
+            tok->merges[a + " " + b] = rank++;
+        } else if (json[p] == '"') {
+            // tolerate the older space joined form
+            p              = bpe_json_str(json, p, len, a);
+            tok->merges[a] = rank++;
+        } else {
+            p++;
+        }
+    }
+
+    // added_tokens: [{"id": N, "content": "..."}]. These carry the 9 MM3
+    // control tokens and are absent from model.vocab, so they extend it.
+    size_t added = bpe_json_find_key(json, len, 0, "added_tokens");
+    int    n_add = 0;
+    if (added != std::string::npos && json[added] == '[') {
+        p = added + 1;
+        while (p < len) {
+            p = bpe_json_ws(json, p, len);
+            if (p >= len || json[p] == ']') {
+                break;
+            }
+            if (json[p] != '{') {
+                p++;
+                continue;
+            }
+            // one object: pick up "id" and "content", skip the rest
+            int         obj_id = -1;
+            std::string content;
+            p++;
+            int depth = 1;
+            while (p < len && depth > 0) {
+                if (json[p] == '"') {
+                    p = bpe_json_str(json, p, len, key);
+                    p = bpe_json_ws(json, p, len);
+                    if (p < len && json[p] == ':') {
+                        p = bpe_json_ws(json, p + 1, len);
+                        if (key == "id") {
+                            char * end = nullptr;
+                            obj_id     = (int) strtol(json + p, &end, 10);
+                            p          = (size_t) (end - json);
+                        } else if (key == "content") {
+                            p = bpe_json_str(json, p, len, content);
+                        }
+                    }
+                    continue;
+                }
+                if (json[p] == '{') {
+                    depth++;
+                } else if (json[p] == '}') {
+                    depth--;
+                }
+                p++;
+            }
+            if (obj_id >= 0 && !content.empty()) {
+                tok->vocab[content] = obj_id;
+                if (obj_id > max_id) {
+                    max_id = obj_id;
+                }
+                n_add++;
+            }
+        }
+    }
+
+    tok->n_vocab = max_id + 1;
+    tok->eos_id  = 151643;
+
+    tok->id_to_str.assign((size_t) tok->n_vocab, std::string());
+    for (auto & kv : tok->vocab) {
+        if (kv.second >= 0 && kv.second < tok->n_vocab) {
+            tok->id_to_str[kv.second] = kv.first;
+        }
+    }
+
+    fprintf(stderr, "[BPE] tokenizer.json: %zu base + %d added = %d vocab, %d merges\n", n_base, n_add, tok->n_vocab,
+            rank);
+    return true;
+}
+
 // Byte-level encode: raw text bytes -> GPT-2 BPE string
 static std::string byte_level_encode(const BPETokenizer * tok, const std::string & text) {
     std::string out;

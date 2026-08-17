@@ -117,6 +117,7 @@ add_library(acestep-core STATIC
     src/pipeline-synth.cpp
     src/pipeline-synth-ops.cpp
     src/pipeline-understand.cpp
+    src/mm3-pipeline.cpp
 )
 target_link_libraries(acestep-core PUBLIC yyjson)
 link_ggml_backends(acestep-core)

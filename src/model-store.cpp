@@ -13,6 +13,7 @@
 #include "model-store.h"
 
 #include "gguf-weights.h"
+#include "mm3-prompt.h"
 #include "timer.h"
 
 #include <cassert>
@@ -34,7 +35,7 @@ struct ModelKeyHash {
     size_t operator()(const ModelKey & k) const noexcept {
         size_t h = std::hash<int>{}(static_cast<int>(k.kind));
         h ^= std::hash<std::string>{}(k.path) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        if (k.kind == MODEL_LM) {
+        if (k.kind == MODEL_LM || k.kind == MODEL_MM3_LM) {
             h ^= std::hash<int>{}(k.max_seq) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
             h ^= std::hash<int>{}(k.n_kv_sets) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         } else if (k.kind == MODEL_DIT) {
@@ -53,7 +54,7 @@ struct ModelKeyEq {
         if (a.kind != b.kind || a.path != b.path) {
             return false;
         }
-        if (a.kind == MODEL_LM) {
+        if (a.kind == MODEL_LM || a.kind == MODEL_MM3_LM) {
             return a.max_seq == b.max_seq && a.n_kv_sets == b.n_kv_sets;
         }
         if (a.kind == MODEL_DIT) {
@@ -104,14 +105,39 @@ struct ModelStore {
     mutable std::mutex mtx;
 };
 
-// Caller holds s->mtx. Evicts every GPU entry whose key does not match the
-// one we are about to load. Aborts if any conflicting module still has
+// Coexistence group of a kind. Every ACE-Step kind is its own singleton
+// group (so nothing about the ACE eviction behaviour changes); the four
+// MiniMax Music 3 kinds collapse into the two pipeline stages that
+// interleave their modules.
+static int coexist_group(ModelKind kind) {
+    switch (kind) {
+        case MODEL_MM3_LM:
+        case MODEL_MM3_DEPTH:
+            return -1;  // MM3 AR stage
+        case MODEL_MM3_DIT:
+        case MODEL_MM3_VAE:
+            return -2;                      // MM3 synthesis stage
+        default:
+            return static_cast<int>(kind);  // singleton
+    }
+}
+
+// Caller holds s->mtx. Evicts every GPU entry that cannot coexist with the
+// one we are about to load: same key stays (cache hit), and a peer of the
+// same coexistence group but a different kind stays too. Everything else
+// goes, which for ACE-Step kinds is "everything whose key differs",
+// exactly as before. Aborts if a conflicting module still has
 // refcount > 0: that would mean two mutually exclusive modules are live at
 // once, which violates the contract in STRICT mode.
 static void evict_all_except(ModelStore * s, const ModelKey & keep) {
+    const int keep_group = coexist_group(keep.kind);
     for (auto it = s->gpu.begin(); it != s->gpu.end();) {
         ModelKeyEq eq;
         if (eq(it->first, keep)) {
+            ++it;
+            continue;
+        }
+        if (it->first.kind != keep.kind && coexist_group(it->first.kind) == keep_group) {
             ++it;
             continue;
         }
@@ -237,6 +263,26 @@ static void del_fsq_detok(void * p) {
     delete static_cast<DetokGGML *>(p);
 }
 
+static void del_mm3_lm(void * p) {
+    mm3_lm_free(static_cast<MM3LM *>(p));
+    delete static_cast<MM3LM *>(p);
+}
+
+static void del_mm3_depth(void * p) {
+    mm3_depth_free(static_cast<MM3Depth *>(p));
+    delete static_cast<MM3Depth *>(p);
+}
+
+static void del_mm3_dit(void * p) {
+    mm3_dit_free(static_cast<MM3DiT *>(p));
+    delete static_cast<MM3DiT *>(p);
+}
+
+static void del_mm3_vae(void * p) {
+    mm3_vae_free(static_cast<MM3VAE *>(p));
+    delete static_cast<MM3VAE *>(p);
+}
+
 // Weight buffer size helpers: different modules use different field names
 // for their backend buffer. VAE and VAE-Enc expose m->buf directly, every
 // other module uses a WeightCtx at m->wctx.buffer. We spell that out per
@@ -271,6 +317,29 @@ static size_t bytes_of_fsq_tok(const TokGGML * m) {
 
 static size_t bytes_of_fsq_detok(const DetokGGML * m) {
     return m && m->wctx.buffer ? ggml_backend_buffer_get_size(m->wctx.buffer) : 0;
+}
+
+// MM3 LM counts its KV cache too: at 9000 frames it is gigabytes, so
+// leaving it out would make the resident total meaningless.
+static size_t bytes_of_mm3_lm(const MM3LM * m) {
+    if (!m) {
+        return 0;
+    }
+    size_t n = m->wctx.buffer ? ggml_backend_buffer_get_size(m->wctx.buffer) : 0;
+    n += m->kv_buf ? ggml_backend_buffer_get_size(m->kv_buf) : 0;
+    return n;
+}
+
+static size_t bytes_of_mm3_depth(const MM3Depth * m) {
+    return m && m->wctx.buffer ? ggml_backend_buffer_get_size(m->wctx.buffer) : 0;
+}
+
+static size_t bytes_of_mm3_dit(const MM3DiT * m) {
+    return m && m->wctx.buffer ? ggml_backend_buffer_get_size(m->wctx.buffer) : 0;
+}
+
+static size_t bytes_of_mm3_vae(const MM3VAE * m) {
+    return m && m->buf ? ggml_backend_buffer_get_size(m->buf) : 0;
 }
 
 Qwen3LM * store_require_lm(ModelStore * s, const ModelKey & k) {
@@ -420,6 +489,82 @@ DetokGGML * store_require_fsq_detok(ModelStore * s, const ModelKey & k) {
     return m;
 }
 
+MM3LM * store_require_mm3_lm(ModelStore * s, const ModelKey & k) {
+    std::lock_guard<std::mutex> lock(s->mtx);
+    if (auto * hit = cache_hit<MM3LM>(s, k)) {
+        return hit;
+    }
+    if (s->policy == EVICT_STRICT) {
+        evict_all_except(s, k);
+    }
+    Timer   t;
+    MM3LM * m = new MM3LM();
+    if (!mm3_lm_load(m, k.path.c_str(), k.max_seq, k.n_kv_sets)) {
+        delete m;
+        return nullptr;
+    }
+    install_entry(s, k, m, bytes_of_mm3_lm(m), "MM3-LM", del_mm3_lm);
+    fprintf(stderr, "[Store] Load MM3-LM: %.0f ms\n", t.ms());
+    return m;
+}
+
+MM3Depth * store_require_mm3_depth(ModelStore * s, const ModelKey & k) {
+    std::lock_guard<std::mutex> lock(s->mtx);
+    if (auto * hit = cache_hit<MM3Depth>(s, k)) {
+        return hit;
+    }
+    if (s->policy == EVICT_STRICT) {
+        evict_all_except(s, k);
+    }
+    Timer      t;
+    MM3Depth * m = new MM3Depth();
+    if (!m->load(k.path.c_str())) {
+        delete m;
+        return nullptr;
+    }
+    install_entry(s, k, m, bytes_of_mm3_depth(m), "MM3-Depth", del_mm3_depth);
+    fprintf(stderr, "[Store] Load MM3-Depth: %.0f ms\n", t.ms());
+    return m;
+}
+
+MM3DiT * store_require_mm3_dit(ModelStore * s, const ModelKey & k) {
+    std::lock_guard<std::mutex> lock(s->mtx);
+    if (auto * hit = cache_hit<MM3DiT>(s, k)) {
+        return hit;
+    }
+    if (s->policy == EVICT_STRICT) {
+        evict_all_except(s, k);
+    }
+    Timer    t;
+    MM3DiT * m = new MM3DiT();
+    if (!m->load(k.path.c_str())) {
+        delete m;
+        return nullptr;
+    }
+    install_entry(s, k, m, bytes_of_mm3_dit(m), "MM3-DiT", del_mm3_dit);
+    fprintf(stderr, "[Store] Load MM3-DiT: %.0f ms\n", t.ms());
+    return m;
+}
+
+MM3VAE * store_require_mm3_vae(ModelStore * s, const ModelKey & k) {
+    std::lock_guard<std::mutex> lock(s->mtx);
+    if (auto * hit = cache_hit<MM3VAE>(s, k)) {
+        return hit;
+    }
+    if (s->policy == EVICT_STRICT) {
+        evict_all_except(s, k);
+    }
+    Timer    t;
+    MM3VAE * m = new MM3VAE();
+    if (!m->load(k.path.c_str())) {
+        delete m;
+        return nullptr;
+    }
+    install_entry(s, k, m, bytes_of_mm3_vae(m), "MM3-VAE", del_mm3_vae);
+    fprintf(stderr, "[Store] Load MM3-VAE: %.0f ms\n", t.ms());
+    return m;
+}
+
 void store_release(ModelStore * s, void * handle) {
     if (!s || !handle) {
         return;
@@ -458,6 +603,27 @@ BPETokenizer * store_bpe(ModelStore * s, const char * lm_path) {
     }
     auto * bpe = new BPETokenizer();
     if (!load_bpe_from_gguf(bpe, lm_path)) {
+        delete bpe;
+        return nullptr;
+    }
+    CpuEntry e;
+    e.ptr     = bpe;
+    e.deleter = [](void * p) {
+        delete static_cast<BPETokenizer *>(p);
+    };
+    s->bpe_by_path.emplace(key, e);
+    return bpe;
+}
+
+BPETokenizer * store_mm3_bpe(ModelStore * s, const char * lm_path) {
+    std::lock_guard<std::mutex> lock(s->mtx);
+    std::string                 key = lm_path ? lm_path : "";
+    auto                        it  = s->bpe_by_path.find(key);
+    if (it != s->bpe_by_path.end()) {
+        return static_cast<BPETokenizer *>(it->second.ptr);
+    }
+    auto * bpe = new BPETokenizer();
+    if (!load_bpe_from_mm3_gguf(bpe, lm_path)) {
         delete bpe;
         return nullptr;
     }

@@ -12,6 +12,7 @@
 //   const ModelEntry * dit = registry_find(reg.dit, "acestep-v15-turbo-Q8_0.gguf");
 
 #include "gguf.h"
+#include "safetensors.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -45,7 +46,21 @@ struct ModelRegistry {
     std::vector<ModelEntry>   text_enc;
     std::vector<ModelEntry>   vae;
     std::vector<AdapterEntry> adapters;
+
+    // MiniMax Music 3 buckets. Both MM3 GGUFs declare the same
+    // general.architecture ("minimax_music3"), so they are told apart by
+    // tensor name probing, and the MM3 VAE is a safetensors file rather
+    // than a GGUF. Kept in their own buckets so nothing about the
+    // ACE-Step resolution path changes.
+    std::vector<ModelEntry> mm3_lm;   // text encoder GGUF: LM + depth + tokenizer
+    std::vector<ModelEntry> mm3_dit;  // diffusion GGUF: DiT + condition encoder
+    std::vector<ModelEntry> mm3_vae;  // DAV decoder safetensors
 };
+
+// True when the registry holds a complete MiniMax Music 3 model set.
+static bool registry_has_mm3(const ModelRegistry & reg) {
+    return !reg.mm3_lm.empty() && !reg.mm3_dit.empty() && !reg.mm3_vae.empty();
+}
 
 // find an entry by name in a bucket. returns NULL if not found.
 static const ModelEntry * registry_find(const std::vector<ModelEntry> & bucket, const char * name) {
@@ -68,7 +83,8 @@ static const AdapterEntry * registry_find_adapter(const ModelRegistry & reg, con
 }
 
 // classify a GGUF file by reading its header.
-// returns: "lm", "dit", "text-enc", "vae", or "" if unrecognized.
+// returns: "LM", "DiT", "Text-Enc", "VAE", "MM3-LM", "MM3-DiT",
+// or "" if unrecognized.
 static std::string registry_classify_gguf(const char * path) {
     struct gguf_init_params params = { true, nullptr };
     struct gguf_context *   ctx    = gguf_init_from_file(path, params);
@@ -81,7 +97,25 @@ static std::string registry_classify_gguf(const char * path) {
     if (idx >= 0) {
         arch = gguf_get_val_str(ctx, idx);
     }
+
+    // MiniMax Music 3 ships both components under one architecture string,
+    // so probe for a signature tensor of each, the same way ComfyUI's
+    // model_detection does. Header only: no weight data is touched.
+    std::string mm3;
+    if (arch == "minimax_music3") {
+        if (gguf_find_tensor(ctx, "diffusion_transformer.transformer.layers.0.self_attn.to_qkv.weight") >= 0 &&
+            gguf_find_tensor(ctx, "latent_conditioners.0.weight") >= 0) {
+            mm3 = "MM3-DiT";
+        } else if (gguf_find_tensor(ctx, "model.audio_decoder.projection.weight") >= 0 &&
+                   gguf_find_tensor(ctx, "model.layers.0.self_attn.qkv_proj.weight") >= 0) {
+            mm3 = "MM3-LM";
+        }
+    }
+
     gguf_free(ctx);
+    if (!mm3.empty()) {
+        return mm3;
+    }
 
     // map GGUF architecture string to bucket name
     if (arch == "acestep-lm") {
@@ -97,6 +131,27 @@ static std::string registry_classify_gguf(const char * path) {
         return "VAE";
     }
     return "";
+}
+
+// Does this .safetensors file hold the MiniMax Music 3 DAV decoder?
+// Same signature ComfyUI's sd.py uses: dec_in_proj.weight plus the still
+// unfolded weight norm parametrization of the first decoder conv.
+// Reads the JSON header only.
+static bool registry_is_mm3_vae(const char * path) {
+    STFile st = {};
+    if (!st_open(&st, path)) {
+        return false;
+    }
+    bool has_proj = false, has_conv = false;
+    for (const auto & e : st.entries) {
+        if (e.name == "dec_in_proj.weight") {
+            has_proj = true;
+        } else if (e.name == "decoder.model.0.weight_g") {
+            has_conv = true;
+        }
+    }
+    st_close(&st);
+    return has_proj && has_conv;
 }
 
 // check if a string ends with a suffix
@@ -199,23 +254,34 @@ static bool registry_is_file(const char * path) {
 #    define REGISTRY_SEP "/"
 #endif
 
-// scan a directory for .gguf files, classify each by architecture.
-// returns true if at least one model was found.
-static bool registry_scan(ModelRegistry * reg, const char * models_dir) {
+// scan one flat directory, classify each model file, append to the buckets.
+// returns the number of files classified.
+static int registry_scan_flat(ModelRegistry * reg, const char * models_dir) {
     std::vector<std::string> files;
     registry_list_dir(models_dir, &files);
     std::sort(files.begin(), files.end());
 
     int count = 0;
     for (const auto & fname : files) {
-        if (!str_ends_with(fname, ".gguf")) {
+        const bool is_gguf = str_ends_with(fname, ".gguf");
+        const bool is_st   = str_ends_with(fname, ".safetensors");
+        if (!is_gguf && !is_st) {
             continue;
         }
 
         std::string full = std::string(models_dir) + REGISTRY_SEP + fname;
-        std::string type = registry_classify_gguf(full.c_str());
+        std::string type;
+        if (is_gguf) {
+            type = registry_classify_gguf(full.c_str());
+        } else if (registry_is_mm3_vae(full.c_str())) {
+            // The only safetensors a models dir is expected to hold: the
+            // MM3 DAV decoder. Anything else stays an adapter candidate.
+            type = "MM3-VAE";
+        }
         if (type.empty()) {
-            fprintf(stderr, "[Registry] WARNING: skipping %s (unknown architecture)\n", fname.c_str());
+            if (is_gguf) {
+                fprintf(stderr, "[Registry] WARNING: skipping %s (unknown architecture)\n", fname.c_str());
+            }
             continue;
         }
 
@@ -228,10 +294,33 @@ static bool registry_scan(ModelRegistry * reg, const char * models_dir) {
             reg->text_enc.push_back(entry);
         } else if (type == "VAE") {
             reg->vae.push_back(entry);
+        } else if (type == "MM3-LM") {
+            reg->mm3_lm.push_back(entry);
+        } else if (type == "MM3-DiT") {
+            reg->mm3_dit.push_back(entry);
+        } else if (type == "MM3-VAE") {
+            reg->mm3_vae.push_back(entry);
         }
 
         fprintf(stderr, "[Registry] %s -> %s\n", fname.c_str(), type.c_str());
         count++;
+    }
+    return count;
+}
+
+// scan a directory for model files, classify each by architecture.
+// The directory itself is scanned flat (the ACE-Step layout), then the
+// three ComfyUI component subdirectories are scanned too when present, so
+// a MiniMax Music 3 checkout laid out as text_encoders/ diffusion_models/
+// vae/ resolves from a single --models argument.
+// returns true if at least one model was found.
+static bool registry_scan(ModelRegistry * reg, const char * models_dir) {
+    int count = registry_scan_flat(reg, models_dir);
+
+    static const char * comfy_subdirs[] = { "text_encoders", "diffusion_models", "vae", "llm", "llms" };
+    for (const char * sub : comfy_subdirs) {
+        std::string path = std::string(models_dir) + REGISTRY_SEP + sub;
+        count += registry_scan_flat(reg, path.c_str());
     }
 
     return count > 0;

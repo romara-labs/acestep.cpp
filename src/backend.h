@@ -18,9 +18,45 @@ struct BackendPair {
     bool           has_gpu;
 };
 
-// Cached backend state (shared across all modules in the same binary)
-static BackendPair g_backend_cache = {};
-static int         g_backend_refs  = 0;
+// Cached backend state (shared across all modules in the same binary).
+//
+// `inline`, not `static`: static in a header gives every translation unit
+// its own copy, so the refcount and the cache would fork per .cpp. That
+// happened to work while only model-store.cpp ever instantiated modules,
+// but it silently breaks the moment a second TU wants to observe or steer
+// the shared backend (the per-stage override below did exactly that).
+// C++17 inline variables give one instance for the whole program.
+inline BackendPair g_backend_cache = {};
+inline int         g_backend_refs  = 0;
+
+// Per-stage device override. NULL (the default) leaves every existing
+// caller on the auto-best / GGML_BACKEND path untouched.
+//
+// The cache above is process wide and refcounted, so a device switch can
+// only happen while nothing is resident. That window exists by
+// construction under EVICT_STRICT: a pipeline stage releases its modules
+// before the next stage requires its own, the refcount hits zero, and
+// backend_release tears the cache down. backend_is_idle() lets callers
+// check for that window instead of assuming it.
+inline const char * g_backend_override = nullptr;
+
+// Force the next backend_init to open this device (e.g. "ROCm0",
+// "Vulkan0", "CUDA0", "CPU"). Pass NULL to go back to the default choice.
+// Takes precedence over the GGML_BACKEND environment variable.
+static void backend_set_override(const char * name) {
+    g_backend_override = name;
+}
+
+// True when no backend is currently resident, so the next backend_init
+// will honour a fresh override rather than hand back the cached device.
+static bool backend_is_idle(void) {
+    return g_backend_refs == 0;
+}
+
+// Name of the resident backend, or "" when idle.
+static const char * backend_current_name(void) {
+    return g_backend_refs > 0 && g_backend_cache.backend ? ggml_backend_name(g_backend_cache.backend) : "";
+}
 
 // Physical core count heuristic (logical / 2 for HT/SMT).
 // Used for GGML CPU thread count: GEMM shares SIMD units across hyperthreads,
@@ -103,13 +139,14 @@ static BackendPair backend_init(const char * label) {
     ggml_backend_load_all();
     BackendPair bp = {};
 
-    // GGML_BACKEND env var: force a specific device instead of auto-best.
-    // Device names: CUDA0, Vulkan0, CPU, BLAS (see ggml_backend_dev_name).
-    const char * force_backend = std::getenv("GGML_BACKEND");
+    // Device selection, in order: per-stage override (set by the caller),
+    // then the GGML_BACKEND env var, then auto-best.
+    // Device names: CUDA0, ROCm0, Vulkan0, CPU, BLAS (ggml_backend_dev_name).
+    const char * force_backend = g_backend_override ? g_backend_override : std::getenv("GGML_BACKEND");
     if (force_backend) {
         bp.backend = ggml_backend_init_by_name(force_backend, nullptr);
         if (!bp.backend) {
-            fprintf(stderr, "[Load] FATAL: GGML_BACKEND=%s not found. Available:", force_backend);
+            fprintf(stderr, "[Load] FATAL: backend '%s' not found. Available:", force_backend);
             for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
                 fprintf(stderr, " %s", ggml_backend_dev_name(ggml_backend_dev_get(i)));
             }
