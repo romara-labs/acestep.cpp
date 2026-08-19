@@ -12,6 +12,7 @@
 #include "gguf-weights.h"
 #include "metadata-fsm.h"
 #include "model-store.h"
+#include "progress.h"
 #include "prompt.h"
 #include "qwen3-lm.h"
 #include "sampling.h"
@@ -342,6 +343,10 @@ int ace_understand_generate(AceUnderstand *      ctx,
         }
 
         gen_tokens.push_back(tok);
+
+        if ((step + 1) % 25 == 0 || step + 1 == max_tokens) {
+            progress_report("lm-understand", step + 1, max_tokens);
+        }
 
         // Next token forward
         qw3lm_forward(model, &tok, 1, 0, logits.data());

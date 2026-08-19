@@ -8,6 +8,7 @@
 #include "dit-graph.h"
 #include "dit.h"
 #include "dwt-haar.h"
+#include "progress.h"
 #include "solvers/solver-registry.h"
 #include "static-graph.h"
 
@@ -705,6 +706,7 @@ static int dit_ggml_generate(DiTGGML *           model,
         }
 
         fprintf(stderr, "[DiT] Step %d/%d t=%.3f\n", step + 1, num_steps, t_curr);
+        progress_report("dit", step + 1, num_steps);
     }
 
     // Batch diagnostic: report per-sample stats to catch corruption

@@ -12,6 +12,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "gguf-weights.h"
+#include "progress.h"
 
 #include <cmath>
 #include <cstdio>
@@ -371,9 +372,9 @@ static struct ggml_tensor * vae_ggml_build_graph(struct ggml_context * ctx,
 // Core compute: ensure graph cached, set input, run. Returns T_audio or -1.
 // Output remains in m->graph_output for caller to read as needed.
 static int vae_ggml_compute(VAEGGML *     m,
-                            const float * latent,    // [T_full, 64] time-major
-                            int           T_latent,  // window length to decode
-                            int           win_start = 0) {     // offset into latent
+                            const float * latent,           // [T_full, 64] time-major
+                            int           T_latent,         // window length to decode
+                            int           win_start = 0) {  // offset into latent
 
     // Build graph only when T_latent changes (cached for tiled decode reuse)
     if (m->graph_T != T_latent) {
@@ -553,6 +554,7 @@ static int vae_ggml_decode_tiled(VAEGGML *     m,
         ggml_backend_tensor_get(m->graph_output, audio_out + max_T_audio + audio_write_pos,
                                 (tile_T + trim_start) * sizeof(float), core_len * sizeof(float));
         audio_write_pos += core_len;
+        progress_report("vae", i + 1, num_steps);
     }
 
     // Compact ch1 from offset max_T_audio to offset audio_write_pos

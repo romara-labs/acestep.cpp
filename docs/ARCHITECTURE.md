@@ -929,6 +929,14 @@ GET  /job?id=N&result=1         Fetch job result
   vae encode: application/octet-stream (raw .vae bytes, no audio echo: client already has it)
   vae decode: audio/mpeg or audio/wav (raw, no latent echo: client already has it)
 
+GET  /job?id=N&stream=1         SSE stream of job progress
+  response: text/event-stream
+  event: progress
+  data: {"status":"running","progress":37,"stage":"dit"}
+  ...one event per progress update, ": ping" heartbeat every 15s,
+  then one terminal event (done|failed|cancelled) and close. The
+  client fetches the payload with /job?id=N&result=1 afterwards.
+
 POST /job?id=N&cancel=1         Cancel a specific job
   response: {"status":"cancelled"}
 
@@ -993,6 +1001,17 @@ Completed jobs sit in memory and are evicted FIFO once the pool exceeds
 32 entries, so a disconnected client can poll and fetch the result after
 reconnecting. Each job has its own cancel flag, set through `POST
 /job?id=N&cancel=1` and polled by the worker between DiT or LM steps.
+
+Progress: the pipelines report `(stage, cur, total)` from their inner
+loops through the process-wide hook in `src/progress.h` (same boundaries
+where cancel is polled). The server maps each stage label onto a slice
+of the 0..100 percent range (`ProgressHook` weights), records it on the
+job and wakes the SSE streamers. Stage labels: `encode` (VAE encode
+tiles), `dit` (denoise steps), `vae` (decode tiles), `lm-metadata`,
+`lm-codes`, `lm-understand` (LM token loops), `ar` (MM3 frames), plus
+server-side `prepare`, `encode` (output codec) and `finalize`. The hook
+is installed only for the duration of a pipeline call; CLI binaries
+never install it and the reports compile out to a null check.
 
 Model loading and eviction are not this section's concern: see
 [ModelStore](#modelstore) for the full story. The short version is that

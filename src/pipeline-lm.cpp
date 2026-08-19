@@ -7,6 +7,7 @@
 #include "bpe.h"
 #include "metadata-fsm.h"
 #include "model-store.h"
+#include "progress.h"
 #include "prompt.h"
 #include "qwen3-lm.h"
 #include "sampling.h"
@@ -270,6 +271,9 @@ static std::vector<std::string> generate_phase1_batch(Qwen3LM *                 
             double elapsed = t_decode.ms() / 1000.0;
             fprintf(stderr, "[LM-Phase1] Step %d, %d active, %.1f tok/s\n", step + 1, n_active,
                     (double) (step + 1) * N / elapsed);
+        }
+        if ((step + 1) % 25 == 0 || step + 1 == max_new_tokens || n_active == 0) {
+            progress_report("lm-metadata", step + 1, max_new_tokens);
         }
     }
 
@@ -548,6 +552,9 @@ static std::vector<std::string> run_phase2_batch(Qwen3LM *                      
             double elapsed = t_decode.ms() / 1000.0;
             fprintf(stderr, "[LM-Phase2] Step %d, %d active, %d total codes, %.1f tok/s\n", step + 1, n_active,
                     total_codes, (double) (step + 1) * N / elapsed);
+        }
+        if ((step + 1) % 25 == 0 || step + 1 == max_tokens || n_active == 0) {
+            progress_report("lm-codes", step + 1, max_tokens);
         }
     }
 

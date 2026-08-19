@@ -381,6 +381,7 @@ static int vae_enc_encode_tiled(VAEEncoder *  m,
         }
 
         latent_write_pos += core_len;
+        progress_report("encode", i + 1, num_steps);
     }
 
     fprintf(stderr, "[VAE-Enc] Tiled encode done: %d tiles -> T_latent=%d (%.2fs @ 48kHz)\n", num_steps,

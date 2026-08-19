@@ -35,6 +35,7 @@
 #include "pipeline-lm.h"
 #include "pipeline-synth.h"
 #include "pipeline-understand.h"
+#include "progress.h"
 #include "request.h"
 #include "synth-batch-runner.h"
 #include "task-types.h"
@@ -56,6 +57,7 @@
 #endif
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
@@ -216,6 +218,15 @@ struct Job {
     std::string            result_body;
     std::string            result_mime;
     std::atomic<bool>      cancel{ false };
+
+    // progress: written by the worker thread through the progress hook,
+    // read by GET /job?id=N&stream=1 SSE streamers. every update bumps
+    // progress_seq under the mutex and notifies the condition variable.
+    std::mutex              mtx_progress;
+    std::condition_variable cv_progress;
+    std::string             stage;             // current pipeline stage label
+    int                     progress     = 0;  // 0..100, monotonic
+    uint64_t                progress_seq = 0;
 
     // memory ordering contract: result_body and result_mime are written
     // before status is stored (seq_cst). the client loads status (seq_cst)
@@ -386,6 +397,130 @@ static const char * job_status_str(JobStatus s) {
     return "unknown";
 }
 
+// status transition with wake-up: every terminal (or optimistic cancel)
+// status change bumps progress_seq so SSE /job streamers emit the final
+// event immediately instead of waiting out their heartbeat window.
+static void job_set_status(const std::shared_ptr<Job> & job, JobStatus st) {
+    job->status.store(st);
+    {
+        std::lock_guard<std::mutex> lock(job->mtx_progress);
+        job->progress_seq++;
+    }
+    job->cv_progress.notify_all();
+}
+
+// progress update from the worker thread: monotonic in percent, stage
+// label straight from the pipeline. duplicate or regressing updates are
+// dropped without waking the streamers.
+static void job_update_progress(const std::shared_ptr<Job> & job, const char * stage, int pct) {
+    if (pct < 0) {
+        pct = 0;
+    }
+    if (pct > 100) {
+        pct = 100;
+    }
+    std::unique_lock<std::mutex> lock(job->mtx_progress);
+    if (pct < job->progress || (pct == job->progress && job->stage == stage)) {
+        return;
+    }
+    job->stage    = stage;
+    job->progress = pct;
+    job->progress_seq++;
+    lock.unlock();
+    job->cv_progress.notify_all();
+}
+
+// pipeline stage -> global percent window. the worker picks one entry per
+// stage the pipeline may report; base + span * frac/100 lands inside [0, 100].
+struct ProgressMap {
+    const char * stage;
+    int          base;
+    int          span;
+};
+
+struct ProgressCtx {
+    std::shared_ptr<Job> job;
+    const ProgressMap *  map;  // terminated by a {nullptr, 0, 0} entry
+};
+
+// progress hook callback: maps a pipeline stage event to the job's global
+// percent window and records it. runs on the worker thread only.
+static void server_progress_cb(void * data, const char * stage, int cur, int total) {
+    auto * ctx = (ProgressCtx *) data;
+    for (const ProgressMap * m = ctx->map; m->stage; m++) {
+        if (!strcmp(m->stage, stage)) {
+            int frac;
+            if (total <= 0 || cur >= total) {
+                frac = 100;
+            } else {
+                frac = cur > 0 ? (int) ((long long) cur * 100 / total) : 0;
+            }
+            job_update_progress(ctx->job, stage, m->base + (int) ((long long) m->span * frac / 100));
+            return;
+        }
+    }
+}
+
+// RAII progress hook install: installs the stage weight map for the
+// duration of a pipeline call, clears it on any exit path. the pipelies
+// never report when no hook is installed, so CLI binaries are unaffected.
+struct ProgressHook {
+    ProgressCtx              ctx;
+    std::vector<ProgressMap> map;
+
+    ProgressHook(const std::shared_ptr<Job> & job, std::vector<ProgressMap> entries) {
+        ctx.job = job;
+        map     = std::move(entries);
+        map.push_back({ nullptr, 0, 0 });
+        ctx.map = map.data();
+        progress_set(server_progress_cb, &ctx);
+    }
+
+    ~ProgressHook() { progress_set(nullptr, nullptr); }
+};
+
+// GET /job?id=N&stream=1: SSE stream of job status + progress.
+// one event per progress update while running, heartbeat comments every
+// 15s, then one terminal event (done|failed|cancelled) and close. the
+// client fetches the payload with GET /job?id=N&result=1 afterwards.
+static void handle_job_stream(const std::shared_ptr<Job> & job, httplib::Response & res) {
+    res.set_header("Cache-Control", "no-cache");
+    res.set_header("X-Accel-Buffering", "no");
+    res.set_chunked_content_provider("text/event-stream", [job](size_t, httplib::DataSink & sink) mutable -> bool {
+        uint64_t last_seq = ~(uint64_t) 0;
+        for (;;) {
+            std::string ev;
+            bool        terminal = false;
+            {
+                std::unique_lock<std::mutex> lock(job->mtx_progress);
+                job->cv_progress.wait_for(lock, std::chrono::seconds(15));
+                JobStatus status = job->status.load();
+                if (job->progress_seq == last_seq) {
+                    ev = ": ping\n\n";
+                } else {
+                    last_seq         = job->progress_seq;
+                    const char * str = job_status_str(status);
+                    ev = status == JobStatus::RUNNING ? "event: progress\n" : std::string("event: ") + str + "\n";
+                    ev += "data: {\"status\":\"";
+                    ev += str;
+                    ev += "\",\"progress\":";
+                    ev += std::to_string(job->progress);
+                    ev += ",\"stage\":\"";
+                    ev += job->stage;
+                    ev += "\"}\n\n";
+                    terminal = status != JobStatus::RUNNING;
+                }
+            }
+            if (!sink.write(ev.c_str(), ev.size())) {
+                return false;
+            }
+            if (terminal) {
+                return false;
+            }
+        }
+    });
+}
+
 // log capture: intercept stderr via pipe, forward to terminal + ring buffer.
 // SSE clients connect to /logs and receive lines in real time.
 #define LOG_RING_BITS 9
@@ -550,9 +685,10 @@ static std::string resolve_name(const std::vector<ModelEntry> & bucket,
 // LM worker: generates metadata + lyrics + codes, stores JSON result in job.
 static void lm_worker(std::shared_ptr<Job> job, std::vector<AceRequest> ace_reqs, int mode) {
     if (job->cancel.load()) {
-        job->status.store(JobStatus::CANCELLED);
+        job_set_status(job, JobStatus::CANCELLED);
         return;
     }
+    job_update_progress(job, "prepare", 0);
 
     const int N = (int) ace_reqs.size();
 
@@ -561,7 +697,7 @@ static void lm_worker(std::shared_ptr<Job> job, std::vector<AceRequest> ace_reqs
     const ModelEntry * entry   = registry_find(g_registry.lm, lm_name.c_str());
     if (!entry) {
         fprintf(stderr, "[Server] LM not found: %s\n", lm_name.c_str());
-        job->status.store(JobStatus::FAILED);
+        job_set_status(job, JobStatus::FAILED);
         return;
     }
     AceLmParams p = g_lm_params;
@@ -573,19 +709,30 @@ static void lm_worker(std::shared_ptr<Job> job, std::vector<AceRequest> ace_reqs
     AceLm * ctx = ace_lm_load(g_store, &p);
     if (!ctx) {
         fprintf(stderr, "[Server] FATAL: LM load failed\n");
-        job->status.store(JobStatus::FAILED);
+        job_set_status(job, JobStatus::FAILED);
         return;
     }
 
     // Execute and always free the ctx, success or failure: the store decides
-    // whether the underlying GPU module stays resident.
+    // whether the underlying GPU module stays resident. Phase 1 (metadata +
+    // lyrics) and phase 2 (audio codes) each map to a slice of the percent
+    // range; inspire/format stop after phase 1 and take the whole range.
     std::vector<AceRequest> out(N);
-    int rc = ace_lm_generate(ctx, ace_reqs.data(), N, out.data(), NULL, NULL, server_cancel_job, (void *) &job->cancel,
+    int                     rc;
+    {
+        ProgressHook hook(job, mode == LM_MODE_GENERATE ?
+                                   std::vector<ProgressMap>{
+                                       { "lm-metadata", 0,  55 },
+                                       { "lm-codes",    55, 44 }
+        } :
+                                   std::vector<ProgressMap>{ { "lm-metadata", 0, 99 } });
+        rc = ace_lm_generate(ctx, ace_reqs.data(), N, out.data(), NULL, NULL, server_cancel_job, (void *) &job->cancel,
                              mode);
+    }
     ace_lm_free(ctx);
 
     if (rc != 0) {
-        job->status.store(job->cancel.load() ? JobStatus::CANCELLED : JobStatus::FAILED);
+        job_set_status(job, job->cancel.load() ? JobStatus::CANCELLED : JobStatus::FAILED);
         return;
     }
 
@@ -609,7 +756,8 @@ static void lm_worker(std::shared_ptr<Job> job, std::vector<AceRequest> ace_reqs
 
     job->result_body = std::move(body);
     job->result_mime = "application/json";
-    job->status.store(JobStatus::DONE);
+    job_update_progress(job, "finalize", 100);
+    job_set_status(job, JobStatus::DONE);
     fprintf(stderr, "[Server] Job %s done (LM, %d results)\n", job->id.c_str(), N);
 }
 
@@ -723,6 +871,7 @@ static void mm3_synth_worker(std::shared_ptr<Job>    job,
                              bool                    output_wav,
                              WavFormat               wav_fmt,
                              int                     peak_clip) {
+    job_update_progress(job, "prepare", 0);
     MM3ModelPaths paths;
     paths.lm               = g_registry.mm3_lm.front().path;
     const ModelEntry * dit = ace_reqs[0].synth_model.empty() ?
@@ -732,7 +881,7 @@ static void mm3_synth_worker(std::shared_ptr<Job>    job,
                                                        registry_find(g_registry.mm3_vae, ace_reqs[0].vae.c_str());
     if (!dit || !vae) {
         fprintf(stderr, "[Server] MM3 model not found in registry\n");
-        job->status.store(JobStatus::FAILED);
+        job_set_status(job, JobStatus::FAILED);
         return;
     }
     paths.dit = dit->path;
@@ -753,21 +902,37 @@ static void mm3_synth_worker(std::shared_ptr<Job>    job,
     std::vector<std::vector<float>> empty_latents;
     const char *                    mime = output_wav ? "audio/wav" : "audio/mpeg";
 
-    for (auto & req : ace_reqs) {
+    // one hook for the whole loop; the per-request weight windows shift
+    // with i so the percent stays monotonic across sequential requests.
+    ProgressHook     hook(job, {});
+    const int        N = (int) ace_reqs.size();
+    std::vector<int> done_tracks(N, 0);
+    for (int ri = 0; ri < N; ri++) {
+        auto & req = ace_reqs[ri];
         if (job->cancel.load()) {
-            job->status.store(JobStatus::CANCELLED);
+            job_set_status(job, JobStatus::CANCELLED);
             return;
         }
+        const int base = (int) ((long long) ri * 100 / N);
+        const int span = (int) ((long long) 100 / N);
+        hook.map       = {
+            { "ar",    base,                   span * 45 / 100 },
+            { "dit",   base + span * 45 / 100, span * 45 / 100 },
+            { "vae",   base + span * 90 / 100, span * 8 / 100  },
+            { nullptr, 0,                      0               }
+        };
+        hook.ctx.map = hook.map.data();
+
         std::vector<std::vector<float>> tracks;
         std::vector<std::string>        codes;
         MM3PipelineStatus               st = mm3_pipeline_generate(&pipe, req, &job->cancel, tracks, &codes);
         if (st == MM3_PIPELINE_CANCELLED) {
-            job->status.store(JobStatus::CANCELLED);
+            job_set_status(job, JobStatus::CANCELLED);
             return;
         }
         if (st != MM3_PIPELINE_OK) {
             fprintf(stderr, "[Server] MM3 generation failed\n");
-            job->status.store(JobStatus::FAILED);
+            job_set_status(job, JobStatus::FAILED);
             return;
         }
         for (auto & track : tracks) {
@@ -782,12 +947,17 @@ static void mm3_synth_worker(std::shared_ptr<Job>    job,
                                                    server_cancel_job, (void *) &job->cancel));
             }
             empty_latents.emplace_back();
+            done_tracks[ri]++;
+            job_update_progress(job, "encode",
+                                base + span * 98 / 100 +
+                                    span * 2 / 100 * done_tracks[ri] / (tracks.size() > 0 ? (int) tracks.size() : 1));
         }
     }
 
     job->result_body = multipart_build_audio_latent(encoded, mime, empty_latents);
     job->result_mime = MULTIPART_MIME;
-    job->status.store(job->cancel.load() ? JobStatus::CANCELLED : JobStatus::DONE);
+    job_update_progress(job, "finalize", 100);
+    job_set_status(job, job->cancel.load() ? JobStatus::CANCELLED : JobStatus::DONE);
     fprintf(stderr, "[Server] Job %s done (MM3, %zu tracks)\n", job->id.c_str(), encoded.size());
 }
 
@@ -816,6 +986,7 @@ static void synth_worker(std::shared_ptr<Job>    job,
         mm3_synth_worker(job, std::move(ace_reqs), output_wav, wav_fmt, peak_clip);
         return;
     }
+    job_update_progress(job, "prepare", 0);
 
     // Generate every request in one DiT batch. synth_batch_size expands each
     // request into per-seed variants. Total clamped to DiT max 9.
@@ -834,7 +1005,7 @@ static void synth_worker(std::shared_ptr<Job>    job,
     if (job->cancel.load()) {
         free(src_interleaved);
         free(ref_interleaved);
-        job->status.store(JobStatus::CANCELLED);
+        job_set_status(job, JobStatus::CANCELLED);
         return;
     }
 
@@ -845,14 +1016,14 @@ static void synth_worker(std::shared_ptr<Job>    job,
         fprintf(stderr, "[Server] DiT not found: %s\n", dit_name.c_str());
         free(src_interleaved);
         free(ref_interleaved);
-        job->status.store(JobStatus::FAILED);
+        job_set_status(job, JobStatus::FAILED);
         return;
     }
     if (g_registry.text_enc.empty() || g_registry.vae.empty()) {
         fprintf(stderr, "[Server] Missing Text-Enc or VAE in registry\n");
         free(src_interleaved);
         free(ref_interleaved);
-        job->status.store(JobStatus::FAILED);
+        job_set_status(job, JobStatus::FAILED);
         return;
     }
     std::string        vae_name = resolve_name(g_registry.vae, ace_reqs[0].vae, g_loaded_vae);
@@ -861,7 +1032,7 @@ static void synth_worker(std::shared_ptr<Job>    job,
         fprintf(stderr, "[Server] VAE not found: %s\n", vae_name.c_str());
         free(src_interleaved);
         free(ref_interleaved);
-        job->status.store(JobStatus::FAILED);
+        job_set_status(job, JobStatus::FAILED);
         return;
     }
 
@@ -877,7 +1048,7 @@ static void synth_worker(std::shared_ptr<Job>    job,
             fprintf(stderr, "[Server] Adapter not found: %s\n", ace_reqs[0].adapter.c_str());
             free(src_interleaved);
             free(ref_interleaved);
-            job->status.store(JobStatus::FAILED);
+            job_set_status(job, JobStatus::FAILED);
             return;
         }
         p.adapter_path  = adapter->path.c_str();
@@ -891,7 +1062,7 @@ static void synth_worker(std::shared_ptr<Job>    job,
         fprintf(stderr, "[Server] FATAL: synth load failed\n");
         free(src_interleaved);
         free(ref_interleaved);
-        job->status.store(JobStatus::FAILED);
+        job_set_status(job, JobStatus::FAILED);
         return;
     }
 
@@ -936,9 +1107,20 @@ static void synth_worker(std::shared_ptr<Job>    job,
     const float *                   src_lat_ptr = src_latents.empty() ? nullptr : src_latents.data();
     const float *                   ref_lat_ptr = ref_latents.empty() ? nullptr : ref_latents.data();
     std::vector<std::vector<float>> captured_latents;
-    const int rc = synth_batch_run(ctx, groups, src_interleaved, src_len, src_lat_ptr, src_T_latent, ref_interleaved,
-                                   ref_len, ref_lat_ptr, ref_T_latent, audio.data(), &captured_latents,
-                                   server_cancel_job, (void *) &job->cancel);
+    int                             rc;
+    {
+        // VAE encode of source/timbre covers [0, 8], DiT denoise [8, 85],
+        // VAE decode tiles [85, 98]. The final encode pass below walks the
+        // last two points track by track.
+        ProgressHook hook(job, {
+                                   { "encode", 0,  8  },
+                                   { "dit",    8,  77 },
+                                   { "vae",    85, 13 }
+        });
+        rc = synth_batch_run(ctx, groups, src_interleaved, src_len, src_lat_ptr, src_T_latent, ref_interleaved, ref_len,
+                             ref_lat_ptr, ref_T_latent, audio.data(), &captured_latents, server_cancel_job,
+                             (void *) &job->cancel);
+    }
     ace_synth_free(ctx);
     free(src_interleaved);
     free(ref_interleaved);
@@ -947,7 +1129,7 @@ static void synth_worker(std::shared_ptr<Job>    job,
         for (auto & a : audio) {
             ace_audio_free(&a);
         }
-        job->status.store(job->cancel.load() ? JobStatus::CANCELLED : JobStatus::FAILED);
+        job_set_status(job, job->cancel.load() ? JobStatus::CANCELLED : JobStatus::FAILED);
         return;
     }
 
@@ -985,6 +1167,7 @@ static void synth_worker(std::shared_ptr<Job>    job,
                                           server_cancel_job, (void *) &job->cancel);
         }
         ace_audio_free(&audio[b]);
+        job_update_progress(job, "encode", 98 + 2 * (b + 1) / (total_tracks > 0 ? total_tracks : 1));
     }
 
     // store result in job: every synth response is multipart, with one audio
@@ -994,7 +1177,8 @@ static void synth_worker(std::shared_ptr<Job>    job,
     job->result_body = multipart_build_audio_latent(encoded, mime, captured_latents);
     job->result_mime = MULTIPART_MIME;
 
-    job->status.store(job->cancel.load() ? JobStatus::CANCELLED : JobStatus::DONE);
+    job_update_progress(job, "finalize", 100);
+    job_set_status(job, job->cancel.load() ? JobStatus::CANCELLED : JobStatus::DONE);
     fprintf(stderr, "[Server] Job %s done (%d tracks)\n", job->id.c_str(), total_tracks);
 }
 
@@ -1183,9 +1367,10 @@ static void understand_worker(std::shared_ptr<Job> job,
                               int                  src_T_latent) {
     if (job->cancel.load()) {
         free(src_interleaved);
-        job->status.store(JobStatus::CANCELLED);
+        job_set_status(job, JobStatus::CANCELLED);
         return;
     }
+    job_update_progress(job, "prepare", 0);
 
     // Resolve LM + DiT (the DiT path carries the tokenizer weights) + VAE.
     std::string        lm_name   = resolve_name(g_registry.lm, ace_req.lm_model, g_loaded_lm);
@@ -1198,7 +1383,7 @@ static void understand_worker(std::shared_ptr<Job> job,
         fprintf(stderr, "[Server] LM, DiT or VAE not found: lm=%s dit=%s vae=%s\n", lm_name.c_str(), dit_name.c_str(),
                 vae_name.c_str());
         free(src_interleaved);
-        job->status.store(JobStatus::FAILED);
+        job_set_status(job, JobStatus::FAILED);
         return;
     }
 
@@ -1211,7 +1396,7 @@ static void understand_worker(std::shared_ptr<Job> job,
     if (!ctx) {
         fprintf(stderr, "[Server] FATAL: understand load failed\n");
         free(src_interleaved);
-        job->status.store(JobStatus::FAILED);
+        job_set_status(job, JobStatus::FAILED);
         return;
     }
 
@@ -1219,13 +1404,22 @@ static void understand_worker(std::shared_ptr<Job> job,
     std::vector<float> captured_latent;
     int                captured_T_latent = 0;
     const float *      src_lat_ptr       = src_latents.empty() ? nullptr : src_latents.data();
-    int rc = ace_understand_generate(ctx, src_interleaved, src_len, src_lat_ptr, src_T_latent, &ace_req, &out,
+    int                rc;
+    {
+        // VAE encode of the source covers [0, 10]; the understand LM decode
+        // (FSQ tokenize included) walks [10, 98].
+        ProgressHook hook(job, {
+                                   { "encode",        0,  10 },
+                                   { "lm-understand", 10, 88 }
+        });
+        rc = ace_understand_generate(ctx, src_interleaved, src_len, src_lat_ptr, src_T_latent, &ace_req, &out,
                                      &captured_latent, &captured_T_latent, server_cancel_job, (void *) &job->cancel);
+    }
     ace_understand_free(ctx);
     free(src_interleaved);
 
     if (rc != 0) {
-        job->status.store(job->cancel.load() ? JobStatus::CANCELLED : JobStatus::FAILED);
+        job_set_status(job, job->cancel.load() ? JobStatus::CANCELLED : JobStatus::FAILED);
         return;
     }
 
@@ -1244,7 +1438,8 @@ static void understand_worker(std::shared_ptr<Job> job,
     std::string json_part = "[" + request_to_json(&out) + "]";
     job->result_body      = multipart_build_json_latent(json_part, captured_latent, captured_T_latent);
     job->result_mime      = MULTIPART_MIME;
-    job->status.store(JobStatus::DONE);
+    job_update_progress(job, "finalize", 100);
+    job_set_status(job, JobStatus::DONE);
     fprintf(stderr, "[Server] Job %s done (understand)\n", job->id.c_str());
 }
 
@@ -1358,15 +1553,16 @@ static void decode_worker(std::shared_ptr<Job> job,
                           WavFormat            wav_fmt,
                           int                  peak_clip) {
     if (job->cancel.load()) {
-        job->status.store(JobStatus::CANCELLED);
+        job_set_status(job, JobStatus::CANCELLED);
         return;
     }
+    job_update_progress(job, "prepare", 0);
 
     std::string        vae_name  = resolve_name(g_registry.vae, ace_req.vae, g_loaded_vae);
     const ModelEntry * vae_entry = registry_find(g_registry.vae, vae_name.c_str());
     if (!vae_entry) {
         fprintf(stderr, "[Server] decode: VAE not found: %s\n", vae_name.c_str());
-        job->status.store(JobStatus::FAILED);
+        job_set_status(job, JobStatus::FAILED);
         return;
     }
 
@@ -1379,18 +1575,24 @@ static void decode_worker(std::shared_ptr<Job> job,
     VAEGGML * vae = store_require_vae_dec(g_store, vae_key);
     if (!vae) {
         fprintf(stderr, "[Server] decode: store_require_vae_dec failed\n");
-        job->status.store(JobStatus::FAILED);
+        job_set_status(job, JobStatus::FAILED);
         return;
     }
     ModelHandle vae_guard(g_store, vae);
 
     int                T_audio_max = (src_T_latent + 64) * 1920;
     std::vector<float> audio_buf((size_t) T_audio_max * 2);
-    int T_audio = vae_ggml_decode_tiled(vae, src_latents.data(), src_T_latent, audio_buf.data(), T_audio_max,
+    int                T_audio;
+    {
+        ProgressHook hook(job, {
+                                   { "vae", 0, 98 }
+        });
+        T_audio = vae_ggml_decode_tiled(vae, src_latents.data(), src_T_latent, audio_buf.data(), T_audio_max,
                                         g_synth_params.vae_chunk, g_synth_params.vae_overlap);
+    }
     if (T_audio < 0) {
         fprintf(stderr, "[Server] decode: vae_ggml_decode_tiled failed\n");
-        job->status.store(JobStatus::FAILED);
+        job_set_status(job, JobStatus::FAILED);
         return;
     }
     fprintf(stderr, "[Server] decode: %d latent frames -> %d audio samples (%.2fs), %.0fms\n", src_T_latent, T_audio,
@@ -1421,7 +1623,8 @@ static void decode_worker(std::shared_ptr<Job> job,
     // client just uploaded it, echoing it back would only burn bandwidth.
     job->result_body = std::move(encoded);
     job->result_mime = mime;
-    job->status.store(job->cancel.load() ? JobStatus::CANCELLED : JobStatus::DONE);
+    job_update_progress(job, "finalize", 100);
+    job_set_status(job, job->cancel.load() ? JobStatus::CANCELLED : JobStatus::DONE);
     fprintf(stderr, "[Server] Job %s done (decode)\n", job->id.c_str());
 }
 
@@ -1442,15 +1645,16 @@ static void encode_worker(std::shared_ptr<Job> job, AceRequest ace_req, float * 
     } buf{ src_interleaved };
 
     if (job->cancel.load()) {
-        job->status.store(JobStatus::CANCELLED);
+        job_set_status(job, JobStatus::CANCELLED);
         return;
     }
+    job_update_progress(job, "prepare", 0);
 
     std::string        vae_name  = resolve_name(g_registry.vae, ace_req.vae, g_loaded_vae);
     const ModelEntry * vae_entry = registry_find(g_registry.vae, vae_name.c_str());
     if (!vae_entry) {
         fprintf(stderr, "[Server] encode: VAE not found: %s\n", vae_name.c_str());
-        job->status.store(JobStatus::FAILED);
+        job_set_status(job, JobStatus::FAILED);
         return;
     }
 
@@ -1463,7 +1667,7 @@ static void encode_worker(std::shared_ptr<Job> job, AceRequest ace_req, float * 
     VAEEncoder * vae = store_require_vae_enc(g_store, vae_key);
     if (!vae) {
         fprintf(stderr, "[Server] encode: store_require_vae_enc failed\n");
-        job->status.store(JobStatus::FAILED);
+        job_set_status(job, JobStatus::FAILED);
         return;
     }
     ModelHandle vae_guard(g_store, vae);
@@ -1476,11 +1680,17 @@ static void encode_worker(std::shared_ptr<Job> job, AceRequest ace_req, float * 
         T_latent_max = MAX_T_LATENT;
     }
     std::vector<float> latent((size_t) T_latent_max * LATENT_CHANNELS);
-    int                T_latent = vae_enc_encode_tiled(vae, src_interleaved, src_len, latent.data(), T_latent_max,
-                                                       g_synth_params.vae_chunk, g_synth_params.vae_overlap);
+    int                T_latent;
+    {
+        ProgressHook hook(job, {
+                                   { "encode", 0, 99 }
+        });
+        T_latent = vae_enc_encode_tiled(vae, src_interleaved, src_len, latent.data(), T_latent_max,
+                                        g_synth_params.vae_chunk, g_synth_params.vae_overlap);
+    }
     if (T_latent < 0) {
         fprintf(stderr, "[Server] encode: vae_enc_encode_tiled failed\n");
-        job->status.store(JobStatus::FAILED);
+        job_set_status(job, JobStatus::FAILED);
         return;
     }
     fprintf(stderr, "[Server] encode: %d audio samples (%.2fs) -> %d latent frames, %.0fms\n", src_len,
@@ -1500,7 +1710,8 @@ static void encode_worker(std::shared_ptr<Job> job, AceRequest ace_req, float * 
     std::memcpy(body.data(), latent.data(), body.size());
     job->result_body = std::move(body);
     job->result_mime = "application/octet-stream";
-    job->status.store(job->cancel.load() ? JobStatus::CANCELLED : JobStatus::DONE);
+    job_update_progress(job, "finalize", 100);
+    job_set_status(job, job->cancel.load() ? JobStatus::CANCELLED : JobStatus::DONE);
     fprintf(stderr, "[Server] Job %s done (encode)\n", job->id.c_str());
 }
 
@@ -1924,6 +2135,11 @@ int main(int argc, char ** argv) {
             json_error(res, 404, "Job not found");
             return;
         }
+        // ?stream=1: SSE stream of status + progress until terminal
+        if (req.has_param("stream") && req.get_param_value("stream") == "1") {
+            handle_job_stream(job, res);
+            return;
+        }
         // ?result=1: return result body
         if (req.has_param("result") && req.get_param_value("result") == "1") {
             if (job->status.load() != JobStatus::DONE) {
@@ -1955,6 +2171,7 @@ int main(int argc, char ** argv) {
             if (status == JobStatus::RUNNING) {
                 job->cancel.store(true);
                 fprintf(stderr, "[Server] Cancel requested for job %s\n", job->id.c_str());
+                job_set_status(job, JobStatus::CANCELLED);  // optimistic, wakes SSE streamers
                 status = JobStatus::CANCELLED;
             }
             std::string body = "{\"status\":\"";

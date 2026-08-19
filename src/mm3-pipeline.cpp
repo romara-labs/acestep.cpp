@@ -25,6 +25,7 @@
 
 #include "mm3-prompt.h"
 #include "philox.h"
+#include "progress.h"
 #include "timer.h"
 
 #include <algorithm>
@@ -343,6 +344,9 @@ static MM3PipelineStatus mm3_replay_stage(MM3Pipeline *            p,
         if (mm3_is_cancelled(cancel)) {
             return MM3_PIPELINE_CANCELLED;
         }
+        if ((k % 25) == 0 || k == n) {
+            progress_report("ar", k, n);
+        }
         const int *   f  = codes.data() + (size_t) k * 8;
         const float * hk = all_hidden.data() + (size_t) (k - 1) * H;
         memcpy(seq8.data(), hk, (size_t) H * sizeof(float));
@@ -459,6 +463,9 @@ static MM3PipelineStatus mm3_ar_stage(MM3Pipeline *                     p,
     for (int frame_index = 0; frame_index <= max_frames; frame_index++) {
         if (mm3_is_cancelled(cancel)) {
             return MM3_PIPELINE_CANCELLED;
+        }
+        if ((frame_index % 25) == 0) {
+            progress_report("ar", frame_index, max_frames);
         }
 
         bool all_done = true;
@@ -784,6 +791,7 @@ MM3PipelineStatus mm3_pipeline_generate(MM3Pipeline *                     p,
         // Ascending sigma schedule: linspace(1, 1/steps) inverted, final 1.0
         const int          steps = recipe.steps;
         std::vector<float> sig((size_t) steps + 1);
+        progress_report("dit", 0, (int) chunk_starts.size());
         for (int i = 0; i < steps; i++) {
             float lin       = steps > 1 ? 1.0f + (1.0f / (float) steps - 1.0f) * (float) i / (float) (steps - 1) : 1.0f;
             sig[(size_t) i] = 1.0f - lin;
@@ -959,13 +967,15 @@ MM3PipelineStatus mm3_pipeline_generate(MM3Pipeline *                     p,
             }
             fprintf(stderr, "[MM3-DiT] Window %zu/%zu: T=%d, %d steps, %.0f ms (%.1f ms/step)\n", k + 1,
                     chunk_starts.size(), T_lat, steps, window_timer.ms(), window_timer.ms() / steps);
+            progress_report("dit", (int) k + 1, (int) chunk_starts.size());
         }
         fprintf(stderr, "[MM3-DiT] CFG=%.2f, %zu windows, %.1f s\n", (double) recipe.dit_cfg, chunk_starts.size(),
                 synth_timer.ms() / 1000.0);
 
         // Decode, crop, stitch each variation
         Timer vae_timer;
-        int   T_last = 0;
+        int   T_last    = 0;
+        int   vae_total = (int) (M * latent_chunks[0].size());
         for (int j = 0; j < M; j++) {
             std::vector<float> & audio_out = tracks_out[(size_t) song * M + j];
             for (size_t k = 0; k < latent_chunks[(size_t) j].size(); k++) {
@@ -986,6 +996,7 @@ MM3PipelineStatus mm3_pipeline_generate(MM3Pipeline *                     p,
                 int left  = (k == 0) ? 0 : MM3_CROP_LEFT * MM3VAE::HOP;
                 int right = (k + 1 == latent_chunks[(size_t) j].size()) ? 0 : MM3_CROP_RIGHT * MM3VAE::HOP;
                 audio_out.insert(audio_out.end(), wav.begin() + (size_t) left * 2, wav.end() - (size_t) right * 2);
+                progress_report("vae", (int) ((size_t) j * latent_chunks[(size_t) j].size() + k + 1), vae_total);
             }
             if (p->dumper.enabled && song == 0 && j == 0) {
                 debug_dump_2d(&p->dumper, "vae_audio", audio_out.data(), (int) (audio_out.size() / 2), 2);
