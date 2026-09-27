@@ -532,20 +532,9 @@ static std::condition_variable cv_log;
 static std::string             log_ring[LOG_RING_SIZE];
 static uint64_t                log_seq = 0;
 
-static int g_real_stderr_fd = -1;
-static int g_pipe_read_fd   = -1;
-
-static void setup_log_capture() {
-    g_real_stderr_fd = fd_dup(STDERR_FILENO);
-    int pipefd[2];
-    if (fd_pipe(pipefd) != 0) {
-        g_real_stderr_fd = -1;
-        return;
-    }
-    g_pipe_read_fd = pipefd[0];
-    fd_dup2(pipefd[1], STDERR_FILENO);
-    fd_close(pipefd[1]);
-}
+static int         g_real_stderr_fd = -1;
+static int         g_pipe_read_fd   = -1;
+static std::thread g_log_reader;
 
 // reader thread: drain pipe, forward to real stderr, push lines to ring.
 // exits when the write end of the pipe is closed (fd_dup2 restores real stderr).
@@ -577,38 +566,46 @@ static void log_reader_main() {
     fd_close(g_pipe_read_fd);
 }
 
-static void teardown_log_capture() {
+// Restore stderr and drain the reader before the pipe dies with the process.
+// Idempotent: the destructor and the exit hook both land here, either order.
+static void log_capture_stop() {
     if (g_real_stderr_fd < 0) {
         return;
     }
     fflush(stderr);
+    // the restore drops the last write end, so the reader reads EOF and returns
     fd_dup2(g_real_stderr_fd, STDERR_FILENO);
-    // g_real_stderr_fd stays open: the reader thread writes to it
+    cv_log.notify_all();
+    if (g_log_reader.joinable()) {
+        g_log_reader.join();
+    }
+    fd_close(g_real_stderr_fd);
+    g_real_stderr_fd = -1;
 }
 
-// RAII: captures stderr on construction, restores + joins reader on destruction.
-// safe on any exit path (early arg errors, model load failures, normal shutdown).
+static void setup_log_capture() {
+    g_real_stderr_fd = fd_dup(STDERR_FILENO);
+    int pipefd[2];
+    if (fd_pipe(pipefd) != 0) {
+        fd_close(g_real_stderr_fd);
+        g_real_stderr_fd = -1;
+        return;
+    }
+    g_pipe_read_fd = pipefd[0];
+    fd_dup2(pipefd[1], STDERR_FILENO);
+    fd_close(pipefd[1]);
+    // A loader aborts the process with exit() on a fatal error, which skips
+    // every destructor: the hook still drains the pipe, so the message that
+    // explains the failure reaches the terminal.
+    atexit(log_capture_stop);
+    g_log_reader = std::thread(log_reader_main);
+}
+
+// RAII: captures stderr on construction, restores and drains on destruction.
 struct LogCapture {
-    std::thread reader;
+    LogCapture() { setup_log_capture(); }
 
-    LogCapture() {
-        setup_log_capture();
-        reader = std::thread(log_reader_main);
-    }
-
-    ~LogCapture() {
-        teardown_log_capture();
-        cv_log.notify_all();
-        if (reader.joinable()) {
-            reader.join();
-        }
-
-        // reader is done draining the pipe, safe to close
-        if (g_real_stderr_fd >= 0) {
-            fd_close(g_real_stderr_fd);
-            g_real_stderr_fd = -1;
-        }
-    }
+    ~LogCapture() { log_capture_stop(); }
 };
 
 // GET /logs: SSE stream of stderr lines.
@@ -1186,8 +1183,9 @@ static void synth_worker(std::shared_ptr<Job>    job,
 // returns JSON {"id":"N"} immediately.
 // input:
 //   application/json body        -> single request {} or batch [{req0}, {req1}, ...]
-//   multipart/form-data          -> single request + optional audio or latents
-//     part "request":     JSON text (model selection, output_format, etc.)
+//   multipart/form-data          -> same request JSON + optional audio or latents
+//     part "request":     JSON text, single {} or batch [{req0}, {req1}, ...]
+//                         (model selection, output_format, etc.)
 //     part "audio":       source audio (WAV or MP3)
 //     part "src_latents": pre-encoded source latents (raw f32, [T*64]), wins over "audio"
 //     part "ref_audio":   timbre reference audio (WAV or MP3), optional
@@ -1221,9 +1219,8 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
     int                     ref_T_latent = 0;
 
     if (req.is_multipart_form_data()) {
-        // multipart mode: single request + optional audio files or src_latents
-        AceRequest ace_req;
-
+        // multipart mode: request JSON plus optional audio files or src_latents.
+        // The source and the timbre reference are shared by every request of a batch.
         std::string json_body;
         if (req.form.has_file("request")) {
             json_body = req.form.get_file("request").content;
@@ -1233,7 +1230,7 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
             json_error(res, 400, "Multipart: missing 'request' part");
             return;
         }
-        if (!request_parse_json(&ace_req, json_body.c_str())) {
+        if (!request_parse_json_array(json_body.c_str(), &ace_reqs)) {
             json_error(res, 400, "Multipart: invalid JSON in 'request' part");
             return;
         }
@@ -1309,7 +1306,6 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
                 }
             }
         }
-        ace_reqs.push_back(ace_req);
     } else {
         // plain JSON body: single object {} or array [{}, ...]
         if (!request_parse_json_array(req.body.c_str(), &ace_reqs)) {
@@ -1910,7 +1906,7 @@ static void handle_props(const httplib::Request &, httplib::Response & res) {
     yyjson_mut_obj_add_val(doc, presets, "sft", sft);
 
     // serialize
-    yyjson_write_flag flags = YYJSON_WRITE_PRETTY | YYJSON_WRITE_PRETTY_TWO_SPACES | YYJSON_WRITE_FP_TO_FIXED(2);
+    yyjson_write_flag flags = YYJSON_WRITE_PRETTY | YYJSON_WRITE_PRETTY_TWO_SPACES | YYJSON_WRITE_FP_TO_FLOAT;
     char *            json  = yyjson_mut_write(doc, flags, NULL);
     yyjson_mut_doc_free(doc);
     res.set_content(json, "application/json");
@@ -2003,11 +1999,7 @@ int main(int argc, char ** argv) {
             g_lm_params.clamp_fp16    = true;
             g_synth_params.clamp_fp16 = true;
 
-        } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            usage(argv[0]);
-            return 0;
         } else {
-            fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
             return 1;
         }
@@ -2015,12 +2007,11 @@ int main(int argc, char ** argv) {
 
     // --models is required
     if (!models_dir) {
-        fprintf(stderr, "[Server] ERROR: --models is required\n");
         usage(argv[0]);
         return 1;
     }
 
-    // stderr capture for SSE /logs (must be after arg parsing so --help prints directly)
+    // stderr capture for SSE /logs (must be after arg parsing so the usage prints directly)
     LogCapture log_capture;
 
     // scan models directory (reads GGUF metadata only)
@@ -2211,8 +2202,12 @@ int main(int argc, char ** argv) {
             have_understand ? " /understand" : "");
     fprintf(stderr, "[Server] Models: %zu LM, %zu Text-Enc, %zu DiT, %zu VAE, %zu Adapter\n", g_registry.lm.size(),
             g_registry.text_enc.size(), g_registry.dit.size(), g_registry.vae.size(), g_registry.adapters.size());
+    // A failed bind must reach the caller: a supervisor that reads only the
+    // exit code would otherwise believe the daemon is up.
+    int exit_code = 0;
     if (!svr.listen(host, port)) {
         fprintf(stderr, "[Server] FATAL: cannot bind %s:%d\n", host, port);
+        exit_code = 1;
     }
 
     // stop worker thread (finishes current job, discards pending)
@@ -2228,5 +2223,5 @@ int main(int argc, char ** argv) {
     store_free(g_store);
     fprintf(stderr, "[Server] Done\n");
 
-    return 0;
+    return exit_code;
 }

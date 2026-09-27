@@ -87,23 +87,17 @@ int main(int argc, char ** argv) {
             params.use_fsm = false;
         } else if (!strcmp(argv[i], "--no-fa")) {
             params.use_fa = false;
-        } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            usage(argv[0]);
-            return 0;
         } else {
-            fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
             return 1;
         }
     }
 
     if (!models_dir) {
-        fprintf(stderr, "[CLI] ERROR: --models required\n");
         usage(argv[0]);
         return 1;
     }
     if (!src_audio_path) {
-        fprintf(stderr, "[CLI] ERROR: --src-audio required\n");
         usage(argv[0]);
         return 1;
     }

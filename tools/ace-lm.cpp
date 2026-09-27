@@ -72,23 +72,17 @@ int main(int argc, char ** argv) {
             dump_logits = argv[++i];
         } else if (!strcmp(argv[i], "--dump-tokens") && i + 1 < argc) {
             dump_tokens = argv[++i];
-        } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            usage(argv[0]);
-            return 0;
         } else {
-            fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
             return 1;
         }
     }
 
     if (!models_dir) {
-        fprintf(stderr, "[CLI] ERROR: --models required\n");
         usage(argv[0]);
         return 1;
     }
     if (!request_path) {
-        fprintf(stderr, "[CLI] ERROR: --request required\n");
         usage(argv[0]);
         return 1;
     }

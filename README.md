@@ -78,6 +78,8 @@ buildall.cmd      # all backends (CUDA + Vulkan + CPU, runtime loading)
 NVCC_CCBIN=g++-13 ./buildcuda.sh # rolling release distros (Arch w/ GCC 16, etc.)
 ```
 
+`-DGGML_SOURCE_DIR=<path>` swaps the ggml submodule for another tree (upstream ggml, llama.cpp/ggml).
+
 macOS auto-enables Metal and Accelerate BLAS with any of the above.
 
 ## Run

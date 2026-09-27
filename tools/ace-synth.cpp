@@ -277,23 +277,17 @@ int main(int argc, char ** argv) {
             vae_chunk = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--vae-overlap") && i + 1 < argc) {
             vae_overlap = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            usage(argv[0]);
-            return 0;
         } else {
-            fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
             return 1;
         }
     }
 
     if (!models_dir) {
-        fprintf(stderr, "[CLI] ERROR: --models required\n");
         usage(argv[0]);
         return 1;
     }
     if (request_paths.empty() && !have_cli_req) {
-        fprintf(stderr, "[CLI] ERROR: --request required (or --caption/--lyrics for MiniMax Music 3)\n");
         usage(argv[0]);
         return 1;
     }
